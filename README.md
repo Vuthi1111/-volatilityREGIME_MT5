@@ -1,69 +1,87 @@
-# 🤖 Machine Learning Volatility Regime Filter
+# Quantitative Volatility Regime Matrix
 
-An institutional-grade Machine Learning pipeline designed to predict intraday volatility regimes on the **Nasdaq 100 (NAS100)**. By predicting whether the next 4 hours will be **HIGH VOL** (trending) or **LOW VOL** (range-bound), this model acts as a highly accurate quality gate for quantitative trading strategies.
+An institutional-grade Machine Learning pipeline and Terminal Dashboard designed to predict intraday volatility regimes on the Nasdaq 100 (NAS100) and Gold (XAUUSD). By predicting whether the market will be in an expansive (trending) or compressive (range-bound) state, this system acts as a highly accurate quantitative execution gate.
 
-## 🎯 The Core Concept
-Different trading strategies require different market conditions to survive:
-* **Opening Range Breakouts (ORB)** and Trend Following strategies thrive in HIGH VOL conditions.
-* **Mean Reversion** (VWAP/Bollinger Band fades) thrive in LOW VOL conditions and get destroyed on trend days.
+## System Architecture
 
-Instead of trying to build one magic strategy that works in all markets, this project uses a **LightGBM Classifier** to identify the *environment*, allowing you to toggle your strategies on or off before the New York session even begins.
-
----
-
-## 🔬 System Architecture
-
-The pipeline is built with strict defenses against data leakage (lookahead bias), utilizing a Walk-Forward Validation engine.
+The pipeline is built with strict defenses against data leakage, utilizing a Walk-Forward Validation engine combined with a real-time MetaTrader 5 (MT5) telemetry bridge.
 
 ### 1. Feature Engineering
-The model is fed 1-Hour candlestick data and engineered features that institutions use to measure market turbulence:
-* **Garman-Klass Volatility:** Captures intra-bar extreme movements better than standard standard deviation.
+The model consumes 1-Minute and 1-Hour tick data and engineers features used to measure market turbulence:
+* **Garman-Klass Volatility:** Captures intra-bar extreme movements superior to standard deviation.
 * **Heterogeneous Autoregressive (HAR) Volatility:** Measures the persistence of volatility across daily, weekly, and monthly horizons.
-* **RiskMetrics EWMA:** Exponentially weighted moving average of squared returns to capture volatility clustering (the tendency for calm days to be followed by calm days, and crazy days by crazy days).
+* **RiskMetrics EWMA:** Exponentially weighted moving average of squared returns to capture volatility clustering.
 
-### 2. The Target Variable (Leakage Prevention)
-The model attempts to predict the realized variance of the *next* 4 hours. 
-> **Critical Engineering Detail:** To prevent same-bar leakage (where the Open/Close of the 1H prediction bar overlaps with the Open/Close of the target measurement), the pipeline enforces a **4-hour embargo** (`bar_offset=4`). The model is strictly blind to the future.
-
-### 3. The Inference Engine
-Using `LightGBM` (Gradient Boosted Trees), the model outputs a probability score from 0.0 to 1.0.
-* **`P > 0.70` (HIGH VOL):** The market is entering a highly expansive, trending state. (Green light for ORB, Red light for Mean Reversion).
-* **`P < 0.30` (LOW VOL):** The market is choppy, compressing, or range-bound. (Red light for ORB, Green light for Mean Reversion).
-* **`0.30 < P < 0.70` (UNCERTAIN):** No statistical edge.
+### 2. Live Inference Engine
+Using LightGBM (Gradient Boosted Trees), the model constantly recalculates the probability of entering a high-volatility regime.
+* **P > 0.70 (EXPANSIVE):** The market is entering a highly expansive, trending state. The system instructs executing Trend Following strategies.
+* **P < 0.30 (COMPRESSIVE):** The market is range-bound. The system instructs executing Mean Reversion strategies and fading extremes.
+* **0.30 < P < 0.70 (UNCERTAIN):** No statistical edge. Cash position advised.
 
 ---
 
-## 📊 Backtest Results & Strategy Impact
+## Terminal Dashboard Interface
+
+The system features a zero-latency, pure-Python Terminal User Interface (TUI) powered by the `Textual` framework, providing real-time data streaming and advanced visual analytics directly in the console.
+
+### Multi-Asset Telemetry
+Real-time tracking of NAS100 and GOLD, displaying the last close, session highs/lows, exact tick volume, and live Bid/Ask spreads directly piped from MetaTrader 5.
+
+### Advanced Terminal Charting
+A Bloomberg-style charting engine built entirely in the terminal using `plotext`. 
+* Dynamically resamples 1-minute tick data into 5m, 15m, 30m, and 1H timeframes.
+* Allows toggling between Candlesticks, Line Charts, and Market Profile views.
+* Computes and overlays technical indicators (SMA-20, Bollinger Bands, and Point of Control lines) on the fly.
+
+### Institutional Market Profile (TPO)
+Generates dynamic Time Price Opportunity (TPO) bell curves across custom lookback horizons (1, 10, 30, or 90 days). The algorithm groups market action into 30-minute intervals, assigns classic TPO letters, and isolates the Point of Control (POC) for deep structural support/resistance analysis.
+
+### Liquidity Profiler
+Maps relative tick volume density against 120-period moving averages to identify sudden institutional participation or volume droughts.
+
+### Execution Matrix & Macro News Integration
+The Execution Matrix actively locks or unlocks based on the LightGBM probability engine. Additionally, the dashboard automatically polls the ForexFactory API for High-Impact USD macroeconomic data, initiating strict "News Blackouts" 2 minutes prior to major releases (e.g., CPI, NFP) to protect the algorithms from spread-widening events.
+
+---
+
+## Backtest & Strategic Impact
 
 We tested the ML Regime filter by wrapping it around two completely different algorithmic strategies:
 
-### 1. The ORB Strategy (Opening Range Breakout)
-* **Without Filter:** The baseline ORB strategy suffers a **-14.5%** Maximum Drawdown.
-* **With ML Filter:** By skipping the choppy LOW VOL days where breakouts fail, the Maximum Drawdown was slashed to **-7.9%**, effectively cutting risk in half while preserving the edge.
+### 1. Trend Following (ORB)
+* **Without Filter:** The baseline strategy suffers a -14.5% Maximum Drawdown.
+* **With ML Filter:** By skipping the compressive days where breakouts fail, the Maximum Drawdown was slashed to -7.9%, effectively cutting risk in half while preserving the edge.
 
-### 2. Mean Reversion Strategies
-* **Without Filter:** Standard VWAP band-fade strategies blow up their accounts (-70% to -95% drawdowns) because they try to fade aggressive trend days.
-* **With ML Filter:** By strictly limiting mean-reversion trades to the predicted LOW VOL days, the drawdowns were mathematically halved across all variants (Session VWAP, Overnight VWAP, and Bollinger Bands).
+### 2. Mean Reversion
+* **Without Filter:** Standard band-fade strategies suffer massive drawdowns (-70% to -95%) during aggressive trend days.
+* **With ML Filter:** By strictly limiting mean-reversion trades to the predicted low volatility days, drawdowns were mathematically halved across all variants tested.
 
 ---
 
-## 🛠️ Project Structure
+## Project Structure
+
 ```text
 volatility_regime_model/
 ├── src/
-│   ├── feature_engineering.py     # Volatility math (GK, HAR, EWMA)
+│   ├── dashboard.py               # Main Terminal Dashboard Application
+│   ├── live_inference.py          # LightGBM Production Model Wrapper
+│   ├── feature_engineering.py     # Volatility Math (GK, HAR, EWMA)
+│   ├── macro_data.py              # ForexFactory API Integration
 │   ├── run_pipeline.py            # Walk-forward train/test engine
-│   ├── model_stack.py             # Model definitions (LightGBM)
-│   ├── visualization.py           # AUC, Calibration, and Equity charting
-│   ├── plot_regime_overlay.py     # Plots NQ price action vs Model probabilities
-│   └── mean_reversion_backtest.py # Dual-backtest engine for Mean Reversion testing
+│   └── walk_forward.py            # ML Cross-Validation engine
+├── mt5_bridge/
+│   ├── ExportLiveEA.mq5           # Real-time MT5 tick extractor
+│   └── ExportLive1H.mq5           # Historical data extractor
 └── README.md
 ```
 
-## 🚀 Usage
-This engine is designed to be run locally in an Anaconda environment (`/opt/anaconda3/bin/python`).
+## Usage
 
-To run the pipeline and generate fresh predictions:
+This engine is designed to be run locally in an Anaconda environment.
+
+1. Attach the `ExportLiveEA.mq5` to your MetaTrader 5 charts for NAS100 and GOLD.
+2. Launch the terminal dashboard:
+
 ```bash
-python src/run_pipeline.py
+/opt/anaconda3/bin/python src/dashboard.py
 ```
