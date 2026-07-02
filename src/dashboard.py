@@ -453,7 +453,11 @@ class DashboardApp(App):
         
         for asset in ["NAS100", "GOLD"]:
             try:
-                hist_path = f"/Users/macos/Documents/ALGO/03_Data/raw/{asset}/1h_data.csv"
+                if asset == "NAS100":
+                    hist_path = "/Users/macos/Documents/ALGO/03_Data/raw/NAS100/1h_data.csv"
+                else:
+                    hist_path = "/Users/macos/Documents/ALGO/03_Data/raw/GOLD_XAUUSD/XAUUSD_1H.csv"
+                
                 df_hist = await asyncio.to_thread(load_mt5_csv, hist_path)
                 df_daily = df_hist.resample('D').agg({'High': 'max', 'Low': 'min'}).dropna()
                 adr_20 = (df_daily['High'] - df_daily['Low']).rolling(20).mean().iloc[-1]
