@@ -17,7 +17,6 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import plotext as plt
 
 from rich.panel import Panel
 from rich.table import Table
@@ -123,159 +122,6 @@ def render_volume_bars(volumes: np.ndarray) -> str:
         
     return f"[cyan]{''.join(chars)}[/cyan]"
 
-def calc_market_profile(df: pd.DataFrame, days: int = 1, bins: int = 24) -> list:
-    """Calculates TPO Market Profile over the last N days."""
-    if len(df) == 0:
-        return []
-    
-    last_date = df.index[-1].date()
-    target_date = last_date - timedelta(days=max(0, days - 1))
-    df_period = df[df.index.date >= target_date]
-    
-    if len(df_period) == 0:
-        return []
-
-    min_px = df_period['Low'].min()
-    max_px = df_period['High'].max()
-    
-    if min_px == max_px:
-        return [(min_px, "█")]
-
-    bin_edges = np.linspace(min_px, max_px, bins + 1)
-    tpo_bins = ["" for _ in range(bins)]
-    
-    groups = df_period.groupby(pd.Grouper(freq='30Min'))
-    tpo_chars = string.ascii_uppercase + string.ascii_lowercase + "0123456789!@#$%^&*"
-    char_idx = 0
-    
-    for name, group in groups:
-        if len(group) == 0:
-            continue
-            
-        g_low = group['Low'].min()
-        g_high = group['High'].max()
-        char = tpo_chars[char_idx % len(tpo_chars)]
-        char_idx += 1
-        
-        for i in range(bins):
-            b_low = bin_edges[i]
-            b_high = bin_edges[i+1]
-            if not (g_high < b_low or g_low > b_high):
-                tpo_bins[i] += char
-                
-    profile = []
-    for i in range(bins):
-        mid_px = (bin_edges[i] + bin_edges[i+1]) / 2
-        profile.append((mid_px, tpo_bins[i]))
-        
-    return profile
-
-def render_market_profile(profile: list) -> str:
-    """Render the TPO Market Profile."""
-    if not profile: return "[dim]No profile data[/dim]"
-    
-    max_tpos = max([len(tpo) for p, tpo in profile])
-    if max_tpos == 0: max_tpos = 1
-    
-    lines = []
-    for price, tpo in reversed(profile):
-        if len(tpo) == max_tpos:
-            lines.append(f"[dim]{price:10.2f}[/dim] │ [b bright_yellow]{tpo}[/b bright_yellow]")
-        else:
-            lines.append(f"[dim]{price:10.2f}[/dim] │ [cyan]{tpo}[/cyan]")
-            
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ADVANCED CHARTING ENGINE (PLOTEXT)
-# ─────────────────────────────────────────────────────────────────────────────
-def resample_ohlcv(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Resamples the 1-minute dataframe to a higher timeframe."""
-    if freq == "1 Min": return df.copy()
-    
-    mapping = {
-        "5 Min": "5Min",
-        "15 Min": "15Min",
-        "30 Min": "30Min",
-        "1 Hour": "1H"
-    }
-    
-    resample_freq = mapping.get(freq, "5Min")
-    agg_dict = {
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Tick_Volume': 'sum'
-    }
-    df_res = df.resample(resample_freq).agg(agg_dict).dropna()
-    return df_res
-
-def make_chart_panel(asset: str, df: pd.DataFrame, freq: str, show_ma: bool, show_bb: bool, show_tpo: bool) -> Panel:
-    if len(df) == 0:
-        return Panel(Text("\n\nNo data available.", justify="center"))
-        
-    df_res = resample_ohlcv(df, freq)
-    df_res = df_res.tail(80) # Keep to 80 candles so it doesn't crush the terminal
-    
-    if len(df_res) == 0:
-        return Panel(Text("\n\nNot enough data for this timeframe.", justify="center"))
-        
-    dates = df_res.index.strftime("%Y-%m-%d %H:%M").tolist()
-    data = {
-        "Open": df_res["Open"].tolist(),
-        "High": df_res["High"].tolist(),
-        "Low":  df_res["Low"].tolist(),
-        "Close": df_res["Close"].tolist()
-    }
-    
-    plt.clear_figure()
-    plt.theme("dark")
-    plt.plotsize(100, 30)
-    plt.date_form("Y-m-d H:M")
-    
-    # Chart Type Logic
-    chart_type_val = getattr(sys.modules[__name__], '_CURRENT_CHART_TYPE', 'Candlestick')
-    
-    if chart_type_val == "Market Profile":
-        # Bypass plotext and just return the TPO text renderer
-        profile = calc_market_profile(df_res, days=1, bins=25)
-        tpo_str = render_market_profile(profile)
-        # Wrap it in nice spacing
-        tpo_str = f"\n{tpo_str}\n\n[dim]Time Price Opportunity (POC)[/dim]"
-        return Panel(Text.from_markup(tpo_str, justify="center"), title=f" ◈  {asset} | {freq} TPO PROFILE ", border_style="cyan", expand=True)
-    
-    elif chart_type_val == "Line Chart":
-        plt.plot(dates, data["Close"], color="cyan", marker="none", label="Close")
-    else:
-        plt.candlestick(dates, data)
-    
-    if show_ma or show_bb:
-        ma = df_res["Close"].rolling(20).mean()
-        
-        if show_ma:
-            plt.plot(dates, ma.tolist(), color="blue", marker="none", label="SMA 20")
-            
-        if show_bb:
-            std = df_res["Close"].rolling(20).std()
-            upper = (ma + 2 * std).tolist()
-            lower = (ma - 2 * std).tolist()
-            plt.plot(dates, upper, color="red", marker="none", label="BB Upper")
-            plt.plot(dates, lower, color="green", marker="none", label="BB Lower")
-            
-    if show_tpo:
-        profile = calc_market_profile(df_res, days=1, bins=20)
-        if profile:
-            max_tpo = max([len(t) for p, t in profile])
-            if max_tpo > 0:
-                poc_price = [p for p, t in profile if len(t) == max_tpo][0]
-                plt.hline(poc_price, color="yellow")
-                
-    plt.title(f"{asset} | {freq} Chart")
-    ansi_str = plt.build()
-    
-    return Panel(Text.from_ansi(ansi_str), title=" ◈  ADVANCED TERMINAL CHART ", border_style="cyan", expand=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -455,19 +301,6 @@ def make_liquidity_panel(asset_title: str, df: pd.DataFrame) -> Panel:
     
     return Panel(t, title=" ◈  LIQUIDITY PROFILER ", border_style="blue", expand=True)
 
-def make_tpo_panel(asset_title: str, df: pd.DataFrame, days: int) -> Panel:
-    profile = calc_market_profile(df, days=days, bins=22)
-    
-    t = Table(show_header=False, expand=True, box=None, padding=(0, 1))
-    t.add_column("Label", style="dim", ratio=1)
-    t.add_column("Value", justify="left", ratio=4)
-    
-    t.add_row("[bold white]INSTRUMENT[/bold white]", f"[b bright_cyan]{asset_title}[/b bright_cyan]")
-    t.add_row("TPO HORIZON", f"[white]{days} DAY(S)[/white]")
-    t.add_row("", "")
-    t.add_row(f"TPO PROFILE\n[dim]Time Price Opportunity (POC)[/dim]", render_market_profile(profile))
-    
-    return Panel(t, title=" ◈  INSTITUTIONAL MARKET PROFILE (TPO) ", border_style="magenta", expand=True)
 
 def make_waiting_panel(csv_path: Path) -> Panel:
     body = (
@@ -522,42 +355,6 @@ class DashboardApp(App):
         margin: 0;
     }
     
-    Select {
-        width: 30;
-        margin-right: 2;
-        margin-bottom: 1;
-    }
-
-    Horizontal.tpo-controls {
-        height: auto;
-        width: 100%;
-    }
-    
-    /* Advanced Charting Layout */
-    .sidebar {
-        width: 35;
-        height: 100%;
-        padding: 1;
-        border-right: solid green;
-    }
-    
-    .sidebar Label {
-        margin-top: 1;
-        text-style: bold;
-        color: cyan;
-    }
-    
-    .sidebar Checkbox {
-        margin-top: 0;
-    }
-
-    .main-view {
-        width: 1fr;
-        height: 100%;
-        padding-left: 2;
-        padding-top: 1;
-    }
-
     /* System Logs tab */
     Log {
         height: 100%;
@@ -579,18 +376,6 @@ class DashboardApp(App):
         super().__init__()
         self.update_count: int = 0
         self.news_events: list = []
-        
-        # TPO Config
-        self.profile_lookback: int = 1
-        self.tpo_instrument: str = "NAS100"
-        
-        # Advanced Chart Config
-        self.chart_instrument: str = "NAS100"
-        self.chart_timeframe: str  = "15 Min"
-        self.chart_type: str       = "Candlestick"
-        self.chart_show_ma: bool   = False
-        self.chart_show_bb: bool   = False
-        self.chart_show_tpo: bool  = False
         
         self.prob_history = {
             "NAS100": deque(maxlen=PROB_HISTORY_LEN),
@@ -623,78 +408,10 @@ class DashboardApp(App):
                     yield Static(Panel(Text("\n\n⏳  Waiting for NAS100 data stream...", justify="center"), border_style="dim", expand=True), id="nas100_liquidity", classes="panel")
                     yield Static(Panel(Text("\n\n⏳  Waiting for GOLD data stream...", justify="center"), border_style="dim", expand=True), id="gold_liquidity", classes="panel")
 
-            with TabPane("📊 Market Profile", id="tab-tpo"):
-                with Horizontal(classes="tpo-controls"):
-                    yield Select(
-                        [("NAS100 (NQ)", "NAS100"), ("GOLD (XAUUSD)", "GOLD")],
-                        value="NAS100",
-                        id="tpo_instrument",
-                        prompt="Select Instrument"
-                    )
-                    yield Select(
-                        [("1 Day", 1), ("10 Days", 10), ("30 Days", 30), ("90 Days", 90)],
-                        value=1,
-                        id="tpo_lookback",
-                        prompt="Select Lookback Window"
-                    )
-                yield Static(Panel(Text("\n\n⏳  Waiting for data stream...", justify="center"), border_style="dim", expand=True), id="tpo_chart", classes="panel")
-
-            with TabPane("📈 Advanced Charting", id="tab-chart"):
-                with Horizontal():
-                    with Vertical(id="chart-sidebar", classes="sidebar"):
-                        yield Label("ASSET")
-                        yield Select(
-                            [("NAS100 (NQ)", "NAS100"), ("GOLD (XAUUSD)", "GOLD")],
-                            value="NAS100", id="chart_instrument"
-                        )
-                        yield Label("TIMEFRAME")
-                        yield Select(
-                            [("1 Min", "1 Min"), ("5 Min", "5 Min"), ("15 Min", "15 Min"), ("30 Min", "30 Min"), ("1 Hour", "1 Hour")],
-                            value="15 Min", id="chart_timeframe"
-                        )
-                        yield Label("CHART TYPE")
-                        yield Select(
-                            [("Candlestick", "Candlestick"), ("Line Chart", "Line Chart"), ("Market Profile", "Market Profile")],
-                            value="Candlestick", id="chart_type"
-                        )
-                        yield Label("INDICATORS")
-                        yield Checkbox("SMA (20)", id="chart_ma", value=False)
-                        yield Checkbox("Bollinger Bands", id="chart_bb", value=False)
-                        yield Checkbox("POC Overlay", id="chart_tpo", value=False)
-                        
-                    with Vertical(id="chart-main", classes="main-view"):
-                        yield Static(Panel(Text("\n\n⏳  Waiting for data stream...", justify="center"), expand=True), id="chart_view")
-
             with TabPane("🖥  System Logs", id="tab-logs"):
                 yield Log(id="syslog", max_lines=LOG_MAX_LINES)
 
         yield Footer()
-
-    # ── Handlers ─────────────────────────────────────────────────────────────
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "tpo_lookback" and event.value is not None:
-            self.profile_lookback = int(event.value)
-            self._log(f"Market Profile lookback updated to {self.profile_lookback} Days.")
-        elif event.select.id == "tpo_instrument" and event.value is not None:
-            self.tpo_instrument = str(event.value)
-            self._log(f"Market Profile instrument updated to {self.tpo_instrument}.")
-        elif event.select.id == "chart_instrument" and event.value is not None:
-            self.chart_instrument = str(event.value)
-            self._log(f"Charting instrument updated to {self.chart_instrument}.")
-        elif event.select.id == "chart_timeframe" and event.value is not None:
-            self.chart_timeframe = str(event.value)
-            self._log(f"Charting timeframe updated to {self.chart_timeframe}.")
-        elif event.select.id == "chart_type" and event.value is not None:
-            self.chart_type = str(event.value)
-            self._log(f"Charting type updated to {self.chart_type}.")
-
-    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
-        if event.checkbox.id == "chart_ma":
-            self.chart_show_ma = event.value
-        elif event.checkbox.id == "chart_bb":
-            self.chart_show_bb = event.value
-        elif event.checkbox.id == "chart_tpo":
-            self.chart_show_tpo = event.value
 
     # ── Boot sequence ────────────────────────────────────────────────────────
     async def on_mount(self) -> None:
@@ -790,18 +507,6 @@ class DashboardApp(App):
             self.query_one(f"#{prefix}_liquidity", Static).update(
                 make_liquidity_panel(asset_title, df_live))
                 
-            # Market Profile Updater (TPO)
-            if asset == self.tpo_instrument:
-                self.query_one("#tpo_chart", Static).update(
-                    make_tpo_panel(asset_title, df_live, self.profile_lookback))
-                    
-            # Advanced Charting Updater
-            if asset == self.chart_instrument:
-                # Hack to pass chart_type to make_chart_panel without breaking signature deeply
-                setattr(sys.modules[__name__], '_CURRENT_CHART_TYPE', self.chart_type)
-                self.query_one("#chart_view", Static).update(
-                    make_chart_panel(asset_title, df_live, self.chart_timeframe, self.chart_show_ma, self.chart_show_bb, self.chart_show_tpo))
-
             if self.update_count % 60 == 0:
                 self._log(
                     f"[{asset} TICK #{self.update_count:05d}]  "
