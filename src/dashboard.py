@@ -410,6 +410,7 @@ class DashboardApp(App):
         # Regime State Tracking
         self.current_regimes = {"NAS100": None, "GOLD": None}
         self.regime_start_times = {"NAS100": None, "GOLD": None}
+        self.regime_is_buffer_limit = {"NAS100": False, "GOLD": False}
 
     # ── Layout ──────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
@@ -497,7 +498,7 @@ class DashboardApp(App):
         
         if nas_reg and gold_reg:
             if nas_reg == "HIGH" and gold_reg == "HIGH":
-                confluence = "[b bright_red]SEVERE RISK-OFF / LIQUIDITY SHOCK (BOTH EXPANDING)[/b bright_red]"
+                confluence = "[b bright_red]SYSTEMIC VOLATILITY SHOCK (BOTH EXPANDING — CHECK DIRECTION)[/b bright_red]"
                 color = "red"
             elif nas_reg == "LOW" and gold_reg == "LOW":
                 confluence = "[b bright_green]SYSTEMIC COMPRESSION (BOTH RANGEBOUND)[/b bright_green]"
@@ -534,7 +535,12 @@ class DashboardApp(App):
 
             X_live    = self.scalers[asset].transform(
                 current_state[self.features[asset]].values.astype(np.float32))
-            prob_high = float(self.models[asset].predict_proba(X_live)[0][1])
+
+            # Calculate SHAP Drivers and Probability (Single Inference Pass)
+            shap_values = self.models[asset].booster_.predict(X_live, pred_contrib=True)[0]
+            raw_margin = np.sum(shap_values)
+            prob_high = float(1.0 / (1.0 + np.exp(-raw_margin)))
+            
             self.prob_history[asset].append(prob_high)
 
             gk_current = float(current_state["GK_10"].values[0])
@@ -559,7 +565,6 @@ class DashboardApp(App):
                 adr_exhaustion = 0.0
 
             # Calculate SHAP Drivers
-            shap_values = self.models[asset].booster_.predict(X_live, pred_contrib=True)[0]
             contributions = shap_values[:-1]
             top_indices = np.argsort(np.abs(contributions))[-3:][::-1]
             top_drivers_list = []
@@ -586,8 +591,10 @@ class DashboardApp(App):
                 if len(changed_indices) > 0:
                     last_change_idx = changed_indices[-1] + 1
                     true_start_dt = live_features.index[last_change_idx]
+                    self.regime_is_buffer_limit[asset] = False
                 else:
                     true_start_dt = live_features.index[0]
+                    self.regime_is_buffer_limit[asset] = True
                     
                 self.current_regimes[asset] = current_regime_val
                 
@@ -605,11 +612,14 @@ class DashboardApp(App):
             if self.current_regimes[asset] != new_regime:
                 self.current_regimes[asset] = new_regime
                 self.regime_start_times[asset] = datetime.now()
+                self.regime_is_buffer_limit[asset] = False
                 
             time_in_regime = datetime.now() - self.regime_start_times[asset]
             mins, secs = divmod(int(time_in_regime.total_seconds()), 60)
             hrs, mins = divmod(mins, 60)
-            time_str = f"{hrs}h {mins}m {secs}s" if hrs > 0 else f"{mins}m {secs}s"
+            
+            buffer_indicator = "+" if self.regime_is_buffer_limit[asset] else ""
+            time_str = f"{hrs}h {mins}m {secs}s{buffer_indicator}" if hrs > 0 else f"{mins}m {secs}s{buffer_indicator}"
 
             # Execution logic & UI
             self.query_one(f"#{prefix}_market_data", Static).update(
