@@ -155,7 +155,7 @@ def make_market_panel(raw_state, last_dt, asset_title: str) -> Panel:
 
 
 def make_ai_panel(prob_high: float, gk_current: float, gk_ratio: float,
-                  ewma_trend: str, history: deque) -> Panel:
+                  ewma_trend: str, history: deque, top_drivers: str = "") -> Panel:
     prob_pct = prob_high * 100
     if prob_high > PROB_HIGH:
         prob_color = "bright_green"
@@ -182,6 +182,8 @@ def make_ai_panel(prob_high: float, gk_current: float, gk_ratio: float,
     t.add_row("", "")
     t.add_row("[dim]CONFIDENCE[/dim]", bar_str)
     t.add_row("PROBABILITY HISTORY", render_sparkline(history))
+    if top_drivers:
+        t.add_row("[b yellow]PRIMARY DRIVERS[/b yellow]", f"[yellow]{top_drivers}[/yellow]")
     t.add_row("", "")
     t.add_row("GARMAN-KLASS (10H)", f"[cyan]{gk_current:.6f}[/cyan]")
     t.add_row("GK vs 30D BASELINE", f"[{'green' if gk_ratio > 1 else 'dim'}]{gk_ratio:.2f}x[/]")
@@ -193,7 +195,7 @@ def make_ai_panel(prob_high: float, gk_current: float, gk_ratio: float,
 
 
 def make_execution_panel(prob_high: float, is_blackout: bool, blackout_title: str,
-                         update_count: int, adr_exhaustion: float = 0.0) -> Panel:
+                         update_count: int, adr_exhaustion: float = 0.0, time_in_regime: str = "0m 0s") -> Panel:
     tick_sym = "●" if update_count % 2 == 0 else "○"
 
     if is_blackout:
@@ -216,7 +218,8 @@ def make_execution_panel(prob_high: float, is_blackout: bool, blackout_title: st
             "[green]──────────────────────────────────────────[/green]\n\n",
             "[dim]STRATEGY:[/dim]  [b white]TREND FOLLOWING[/b white]\n",
             "[dim]ACTION  :[/dim]  [b bright_green]EXECUTE IN DIRECTION OF TREND[/b bright_green]\n",
-            f"[dim]ADR EXH :[/dim]  {adr_str}\n\n",
+            f"[dim]ADR EXH :[/dim]  {adr_str}\n",
+            f"[dim]STATE TIME:[/dim] {time_in_regime}\n\n",
             f"[dim]CYCLE  {tick_sym}  {datetime.now().strftime('%H:%M:%S')}[/dim]",
         ]
         color = "bright_green"
@@ -226,7 +229,8 @@ def make_execution_panel(prob_high: float, is_blackout: bool, blackout_title: st
             "[red]──────────────────────────────────────────[/red]\n\n",
             "[dim]STRATEGY:[/dim]  [b white]MEAN REVERSION[/b white]\n",
             "[dim]ACTION  :[/dim]  [b bright_red]FADE EXTREMES — AVOID TREND ENTRIES[/b bright_red]\n",
-            f"[dim]ADR EXH :[/dim]  {adr_str}\n\n",
+            f"[dim]ADR EXH :[/dim]  {adr_str}\n",
+            f"[dim]STATE TIME:[/dim] {time_in_regime}\n\n",
             f"[dim]CYCLE  {tick_sym}  {datetime.now().strftime('%H:%M:%S')}[/dim]",
         ]
         color = "bright_red"
@@ -236,7 +240,8 @@ def make_execution_panel(prob_high: float, is_blackout: bool, blackout_title: st
             "[yellow]──────────────────────────────────────────[/yellow]\n\n",
             "[dim]STRATEGY:[/dim]  [b white]HOLD — NO STATISTICAL EDGE[/b white]\n",
             "[dim]ACTION  :[/dim]  [b bright_yellow]SIT OUT — AWAIT REGIME CLARITY[/b bright_yellow]\n",
-            f"[dim]ADR EXH :[/dim]  {adr_str}\n\n",
+            f"[dim]ADR EXH :[/dim]  {adr_str}\n",
+            f"[dim]STATE TIME:[/dim] {time_in_regime}\n\n",
             f"[dim]CYCLE  {tick_sym}  {datetime.now().strftime('%H:%M:%S')}[/dim]",
         ]
         color = "bright_yellow"
@@ -372,6 +377,13 @@ class DashboardApp(App):
         color: #55ff55;
         padding: 1;
     }
+
+    #macro_confluence {
+        height: 3;
+        dock: top;
+        margin: 0;
+        padding: 0;
+    }
     """
 
     BINDINGS = [
@@ -394,10 +406,15 @@ class DashboardApp(App):
         self.scalers = {"NAS100": None, "GOLD": None}
         self.features = {"NAS100": None, "GOLD": None}
         self.adr_20_map = {"NAS100": 1.0, "GOLD": 1.0}
+        
+        # Regime State Tracking
+        self.current_regimes = {"NAS100": None, "GOLD": None}
+        self.regime_start_times = {"NAS100": None, "GOLD": None}
 
     # ── Layout ──────────────────────────────────────────────────────────────
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static(Panel("", title=" ◈  MACRO CONFLUENCE ", border_style="dim"), id="macro_confluence")
         with TabbedContent(initial="tab-nas100"):
             with TabPane("⚡ NAS100", id="tab-nas100"):
                 with Grid(id="nas100-grid", classes="main-grid"):
@@ -471,6 +488,23 @@ class DashboardApp(App):
             self.update_asset_stream("GOLD", LIVE_GOLD_PATH, is_blackout, blackout_title)
         )
 
+        nas_reg = self.current_regimes.get("NAS100")
+        gold_reg = self.current_regimes.get("GOLD")
+        
+        if nas_reg and gold_reg:
+            if nas_reg == "HIGH" and gold_reg == "HIGH":
+                confluence = "[b bright_red]SEVERE RISK-OFF / LIQUIDITY SHOCK (BOTH EXPANDING)[/b bright_red]"
+                color = "red"
+            elif nas_reg == "LOW" and gold_reg == "LOW":
+                confluence = "[b bright_green]SYSTEMIC COMPRESSION (BOTH RANGEBOUND)[/b bright_green]"
+                color = "green"
+            else:
+                confluence = f"[b bright_yellow]DIVERGENT MACRO STATES (NAS100: {nas_reg}  |  GOLD: {gold_reg})[/b bright_yellow]"
+                color = "yellow"
+            
+            panel = Panel(Text.from_markup(confluence, justify="center"), title=" ◈  MACRO CONFLUENCE ", border_style=color)
+            self.query_one("#macro_confluence", Static).update(panel)
+
     async def update_asset_stream(self, asset: str, csv_path: Path, is_blackout: bool, blackout_title: str):
         asset_title = "NAS100  (US100)" if asset == "NAS100" else "GOLD  (XAUUSD)"
         prefix = asset.lower()
@@ -520,13 +554,42 @@ class DashboardApp(App):
             else:
                 adr_exhaustion = 0.0
 
+            # Calculate SHAP Drivers
+            shap_values = self.models[asset].booster_.predict(X_live, pred_contrib=True)[0]
+            contributions = shap_values[:-1]
+            top_indices = np.argsort(np.abs(contributions))[-3:][::-1]
+            top_drivers_list = []
+            for idx in top_indices:
+                feat = self.features[asset][idx]
+                val = contributions[idx]
+                sign = "🟢" if val > 0 else "🔴"
+                top_drivers_list.append(f"{feat} {sign}")
+            drivers_str = " | ".join(top_drivers_list)
+
+            # Calculate Regime State Persistence
+            if prob_high > PROB_HIGH:
+                new_regime = "HIGH"
+            elif prob_high < PROB_LOW:
+                new_regime = "LOW"
+            else:
+                new_regime = "NEUTRAL"
+                
+            if self.current_regimes[asset] != new_regime:
+                self.current_regimes[asset] = new_regime
+                self.regime_start_times[asset] = datetime.now()
+                
+            time_in_regime = datetime.now() - self.regime_start_times[asset]
+            mins, secs = divmod(int(time_in_regime.total_seconds()), 60)
+            hrs, mins = divmod(mins, 60)
+            time_str = f"{hrs}h {mins}m {secs}s" if hrs > 0 else f"{mins}m {secs}s"
+
             # Execution logic & UI
             self.query_one(f"#{prefix}_market_data", Static).update(
                 make_market_panel(raw_state, last_dt, asset_title))
             self.query_one(f"#{prefix}_ai_core", Static).update(
-                make_ai_panel(prob_high, gk_current, gk_ratio, ewma_trend, self.prob_history[asset]))
+                make_ai_panel(prob_high, gk_current, gk_ratio, ewma_trend, self.prob_history[asset], drivers_str))
             self.query_one(f"#{prefix}_execution", Static).update(
-                make_execution_panel(prob_high, is_blackout, blackout_title, self.update_count, adr_exhaustion))
+                make_execution_panel(prob_high, is_blackout, blackout_title, self.update_count, adr_exhaustion, time_str))
                 
             # Liquidity Updater
             self.query_one(f"#{prefix}_liquidity", Static).update(
