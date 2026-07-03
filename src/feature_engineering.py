@@ -62,6 +62,32 @@ def load_mt5_csv(path: str, sep: str = "\t", _is_retry: bool = False) -> pd.Data
             raise e
 
 
+def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample any OHLCV dataframe to 4-hour candles."""
+    if df.empty:
+        return df
+        
+    agg_dict = {
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last'
+    }
+    if 'Tick_Volume' in df.columns:
+        agg_dict['Tick_Volume'] = 'sum'
+    if 'Volume' in df.columns:
+        agg_dict['Volume'] = 'sum'
+    if 'Spread' in df.columns:
+        agg_dict['Spread'] = 'mean'
+        
+    # Resample
+    df_4h = df.resample('4H').agg(agg_dict)
+    
+    # Drop rows where there is no data
+    df_4h.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
+    return df_4h
+
+
 def load_news_mask(json_path: str, index: pd.DatetimeIndex,
                    buffer_min: int = 2) -> pd.Series:
     """

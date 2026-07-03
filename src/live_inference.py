@@ -16,7 +16,7 @@ import lightgbm as lgb
 from sklearn.preprocessing import StandardScaler
 
 # Import our custom feature engineering
-from feature_engineering import load_mt5_csv, build_features, build_vol_regime_labels
+from feature_engineering import load_mt5_csv, build_features, build_vol_regime_labels, resample_to_4h
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS
@@ -40,10 +40,7 @@ PROB_LOW  = 0.30
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. TRAIN THE MODEL (Takes < 1 second)
 # ─────────────────────────────────────────────────────────────────────────────
-def train_production_model(asset: str = "NAS100"):
-    """Trains the model on all historical data up to yesterday."""
-    hist_path = get_historical_path(asset)
-    df_hist = load_mt5_csv(str(hist_path))
+def _train_single_model(df_hist: pd.DataFrame):
     feat_df = build_features(df_hist)
     label_df = build_vol_regime_labels(
         df_hist, forward_bars=4, bar_offset=4, 
@@ -66,6 +63,23 @@ def train_production_model(asset: str = "NAS100"):
     model.fit(X_scaled, y)
     
     return model, sc, feature_cols
+
+def train_production_model(asset: str = "NAS100"):
+    """Trains the 1H and 4H models on all historical data up to yesterday."""
+    hist_path = get_historical_path(asset)
+    df_hist_1h = load_mt5_csv(str(hist_path))
+    
+    # Train 1H
+    model_1h, sc_1h, feat_cols_1h = _train_single_model(df_hist_1h)
+    
+    # Train 4H
+    df_hist_4h = resample_to_4h(df_hist_1h)
+    model_4h, sc_4h, feat_cols_4h = _train_single_model(df_hist_4h)
+    
+    return {
+        "1H": (model_1h, sc_1h, feat_cols_1h),
+        "4H": (model_4h, sc_4h, feat_cols_4h)
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. RUN LIVE INFERENCE

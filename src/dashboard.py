@@ -35,7 +35,7 @@ from textual.containers import Grid, Vertical, Horizontal
 # ─────────────────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from feature_engineering import load_mt5_csv, build_features
+from feature_engineering import load_mt5_csv, build_features, resample_to_4h
 from news_fetcher import get_forexfactory_calendar, check_news_blackout
 from live_inference import train_production_model, LIVE_NAS100_PATH, LIVE_GOLD_PATH, PROB_HIGH, PROB_LOW
 from decision_logger import init_db, log_decision
@@ -116,44 +116,39 @@ def make_market_panel(raw_state, last_dt, asset_title: str) -> Panel:
     return Panel(t, title=" ◈  MARKET TELEMETRY ", border_style="bright_blue", expand=True)
 
 
-def make_ai_panel(prob_high: float, gk_current: float, gk_ratio: float,
-                  ewma_trend: str, history: deque, top_drivers: str = "") -> Panel:
-    prob_pct = prob_high * 100
-    if prob_high > PROB_HIGH:
-        prob_color = "bright_green"
-        state_text = "[b bright_green]▲  EXPANSIVE REGIME[/b bright_green]"
-    elif prob_high < PROB_LOW:
-        prob_color = "bright_red"
-        state_text = "[b bright_red]▼  COMPRESSIVE REGIME[/b bright_red]"
-    else:
-        prob_color = "bright_yellow"
-        state_text = "[b bright_yellow]◆  UNCERTAIN / CHOPPY[/b bright_yellow]"
+def make_ai_panel(prob_1h: float, prob_4h: float, gk_current: float, gk_ratio: float,
+                  ewma_trend: str, history_1h, history_4h, top_drivers_1h: str = "", top_drivers_4h: str = "") -> Panel:
+    
+    def _get_state(prob):
+        if prob > PROB_HIGH: return "bright_green", "▲ EXPANSIVE", int(prob * 50)
+        elif prob < PROB_LOW: return "bright_red", "▼ COMPRESSIVE", int(prob * 50)
+        return "bright_yellow", "◆ UNCERTAIN", int(prob * 50)
 
-    filled = int(prob_high * 50)
-    bar_str = (
-        f"[{prob_color}]{'█' * filled}[/{prob_color}]"
-        f"[dim]{'░' * (50 - filled)}[/dim]"
-    )
+    c1, s1, f1 = _get_state(prob_1h)
+    c4, s4, f4 = _get_state(prob_4h)
 
-    t = Table(show_header=False, expand=True, box=None, padding=(0, 1))
-    t.add_column("Label", style="dim", ratio=2)
-    t.add_column("Value", justify="right", ratio=3)
+    bar_1h = f"[{c1}]{'█'*f1}[/{c1}][dim]{'░'*(50-f1)}[/dim]"
+    bar_4h = f"[{c4}]{'█'*f4}[/{c4}][dim]{'░'*(50-f4)}[/dim]"
 
-    t.add_row("HIGH-VOL PROBABILITY", f"[b {prob_color}]{prob_pct:5.1f}%[/b {prob_color}]")
-    t.add_row("REGIME STATE", state_text)
-    t.add_row("", "")
-    t.add_row("[dim]CONFIDENCE[/dim]", bar_str)
-    t.add_row("PROBABILITY HISTORY", render_sparkline(history))
-    if top_drivers:
-        t.add_row("[b yellow]PRIMARY DRIVERS[/b yellow]", f"[yellow]{top_drivers}[/yellow]")
-    t.add_row("", "")
-    t.add_row("GARMAN-KLASS (10H)", f"[cyan]{gk_current:.6f}[/cyan]")
-    t.add_row("GK vs 30D BASELINE", f"[{'green' if gk_ratio > 1 else 'dim'}]{gk_ratio:.2f}x[/]")
-    t.add_row("EWMA MOMENTUM",       ewma_trend)
-    t.add_row("", "")
-    t.add_row("THRESHOLD  HIGH / LOW", f"[green]{PROB_HIGH*100:.0f}%[/green] / [red]{PROB_LOW*100:.0f}%[/red]")
+    t = Table(show_header=True, expand=True, box=None, padding=(0, 1))
+    t.add_column("METRIC", style="dim", ratio=2)
+    t.add_column("1-HOUR CORE", justify="right", ratio=3)
+    t.add_column("4-HOUR CORE", justify="right", ratio=3)
 
-    return Panel(t, title=" ◈  REGIME INFERENCE MATRIX ", border_style="magenta", expand=True)
+    t.add_row("PROBABILITY", f"[b {c1}]{prob_1h*100:5.1f}%[/]", f"[b {c4}]{prob_4h*100:5.1f}%[/]")
+    t.add_row("REGIME STATE", f"[b {c1}]{s1}[/]", f"[b {c4}]{s4}[/]")
+    t.add_row("", "", "")
+    t.add_row("[dim]CONFIDENCE[/dim]", bar_1h, bar_4h)
+    t.add_row("PROBABILITY HISTORY", render_sparkline(history_1h), render_sparkline(history_4h))
+    t.add_row("[b yellow]PRIMARY DRIVERS[/b yellow]", f"[yellow]{top_drivers_1h}[/]", f"[yellow]{top_drivers_4h}[/]")
+    t.add_row("", "", "")
+    t.add_row("GARMAN-KLASS (10H)", f"[cyan]{gk_current:.6f}[/]", "")
+    t.add_row("GK vs 30D BASELINE", f"[{'green' if gk_ratio > 1 else 'dim'}]{gk_ratio:.2f}x[/]", "")
+    t.add_row("EWMA MOMENTUM", ewma_trend, "")
+    t.add_row("", "", "")
+    t.add_row("THRESHOLD  HIGH/LOW", f"[green]{PROB_HIGH*100:.0f}%[/] / [red]{PROB_LOW*100:.0f}%[/]", "")
+
+    return Panel(t, title=" ◈  DUAL-TIMEFRAME INFERENCE MATRIX ", border_style="magenta", expand=True)
 
 
 def make_execution_panel(prob_high: float, is_blackout: bool, blackout_title: str,
@@ -365,18 +360,16 @@ class DashboardApp(App):
         self.news_events: list = []
         
         self.prob_history = {
-            "NAS100": deque(maxlen=PROB_HISTORY_LEN),
-            "GOLD": deque(maxlen=PROB_HISTORY_LEN)
+            "NAS100": {"1H": deque(maxlen=PROB_HISTORY_LEN), "4H": deque(maxlen=PROB_HISTORY_LEN)},
+            "GOLD": {"1H": deque(maxlen=PROB_HISTORY_LEN), "4H": deque(maxlen=PROB_HISTORY_LEN)}
         }
-        self.models = {"NAS100": None, "GOLD": None}
-        self.scalers = {"NAS100": None, "GOLD": None}
-        self.features = {"NAS100": None, "GOLD": None}
+        self.models = {"NAS100": None, "GOLD": None}  # Now holds dicts {"1H": (m, s, f), "4H": (m, s, f)}
         self.adr_20_map = {"NAS100": 1.0, "GOLD": 1.0}
         
-        # Regime State Tracking
-        self.current_regimes = {"NAS100": None, "GOLD": None}
-        self.regime_start_times = {"NAS100": None, "GOLD": None}
-        self.regime_is_buffer_limit = {"NAS100": False, "GOLD": False}
+        # Regime State Tracking (Now tracking both timeframes)
+        self.current_regimes = {"NAS100": {"1H": None, "4H": None}, "GOLD": {"1H": None, "4H": None}}
+        self.regime_start_times = {"NAS100": {"1H": None, "4H": None}, "GOLD": {"1H": None, "4H": None}}
+        self.regime_is_buffer_limit = {"NAS100": {"1H": False, "4H": False}, "GOLD": {"1H": False, "4H": False}}
         
         # Telemetry Snapshots for Discretionary Logger
         self.latest_snapshots = {"NAS100": None, "GOLD": None}
@@ -438,11 +431,9 @@ class DashboardApp(App):
                 adr_20 = (df_daily['High'] - df_daily['Low']).rolling(20).mean().iloc[-1]
                 self.adr_20_map[asset] = adr_20
                 
-                m, s, f = await asyncio.to_thread(train_production_model, asset)
-                self.models[asset] = m
-                self.scalers[asset] = s
-                self.features[asset] = f
-                self._log(f"LightGBM model for {asset} compiled successfully.")
+                models_dict = await asyncio.to_thread(train_production_model, asset)
+                self.models[asset] = models_dict
+                self._log(f"Dual LightGBM models (1H & 4H) for {asset} compiled successfully.")
             except Exception as e:
                 self._log(f"[ERROR] {asset} Model training failed: {e}")
                 self.notify(f"⚠  {asset} Model error: {e}", severity="error", timeout=10)
@@ -467,8 +458,8 @@ class DashboardApp(App):
             self.update_asset_stream("GOLD", LIVE_GOLD_PATH, is_blackout, blackout_title)
         )
 
-        nas_reg = self.current_regimes.get("NAS100")
-        gold_reg = self.current_regimes.get("GOLD")
+        nas_reg = self.current_regimes["NAS100"]["1H"]
+        gold_reg = self.current_regimes["GOLD"]["1H"]
         
         if nas_reg and gold_reg:
             if nas_reg == "HIGH" and gold_reg == "HIGH":
@@ -486,17 +477,87 @@ class DashboardApp(App):
             panel = Panel(Text.from_markup(confluence, justify="center"), title=" ◈  MACRO CONFLUENCE ", border_style=color)
             self.query_one("#macro_confluence", Static).update(panel)
 
-    async def update_asset_stream(self, asset: str, csv_path: Path, is_blackout: bool, blackout_title: str):
-        asset_title = "NAS100  (US100)" if asset == "NAS100" else "GOLD  (XAUUSD)"
-        prefix = asset.lower()
+    async def _compute_inference(self, asset: str, df_live: pd.DataFrame, timeframe: str):
+        # timeframe is '1H' or '4H'
+        model, scaler, feature_cols = self.models[asset][timeframe]
         
-        if self.models[asset] is None:
-            return  # Model failed to boot
+        live_features = await asyncio.to_thread(build_features, df_live)
+        current_state = live_features.iloc[[-1]]
+        last_dt       = live_features.index[-1]
+
+        X_live    = scaler.transform(current_state[feature_cols].values.astype(np.float32))
+
+        # Calculate SHAP Drivers and Probability
+        shap_values = model.booster_.predict(X_live, pred_contrib=True)[0]
+        raw_margin = np.sum(shap_values)
+        prob_high = float(1.0 / (1.0 + np.exp(-raw_margin)))
+        
+        self.prob_history[asset][timeframe].append(prob_high)
+
+        # Calculate SHAP Drivers
+        contributions = shap_values[:-1]
+        top_indices = np.argsort(np.abs(contributions))[-3:][::-1]
+        top_drivers_list = []
+        for idx in top_indices:
+            feat = feature_cols[idx]
+            val = contributions[idx]
+            sign = "🟢" if val > 0 else "🔴"
+            top_drivers_list.append(f"{feat} {sign}")
+        drivers_str = " | ".join(top_drivers_list)
+
+        # Calculate Regime State Persistence
+        if self.current_regimes[asset][timeframe] is None:
+            X_all = scaler.transform(live_features[feature_cols].values.astype(np.float32))
+            probs_all = model.predict_proba(X_all)[:, 1]
             
+            regimes = np.full(len(probs_all), "NEUTRAL", dtype=object)
+            regimes[probs_all > PROB_HIGH] = "HIGH"
+            regimes[probs_all < PROB_LOW] = "LOW"
+            
+            current_regime_val = regimes[-1]
+            changed_indices = np.where(regimes != current_regime_val)[0]
+            
+            if len(changed_indices) > 0:
+                last_change_idx = changed_indices[-1] + 1
+                true_start_dt = live_features.index[last_change_idx]
+                self.regime_is_buffer_limit[asset][timeframe] = False
+            else:
+                true_start_dt = live_features.index[0]
+                self.regime_is_buffer_limit[asset][timeframe] = True
+                
+            self.current_regimes[asset][timeframe] = current_regime_val
+            
+            broker_elapsed = last_dt - true_start_dt
+            self.regime_start_times[asset][timeframe] = datetime.now() - broker_elapsed
+
+        if prob_high > PROB_HIGH:
+            new_regime = "HIGH"
+        elif prob_high < PROB_LOW:
+            new_regime = "LOW"
+        else:
+            new_regime = "NEUTRAL"
+            
+        if self.current_regimes[asset][timeframe] != new_regime:
+            self.current_regimes[asset][timeframe] = new_regime
+            self.regime_start_times[asset][timeframe] = datetime.now()
+            self.regime_is_buffer_limit[asset][timeframe] = False
+            
+        time_in_regime = datetime.now() - self.regime_start_times[asset][timeframe]
+        mins, secs = divmod(int(time_in_regime.total_seconds()), 60)
+        hrs, mins = divmod(mins, 60)
+        
+        buffer_indicator = "+" if self.regime_is_buffer_limit[asset][timeframe] else ""
+        time_str = f"{hrs}h {mins}m {secs}s{buffer_indicator}" if hrs > 0 else f"{mins}m {secs}s{buffer_indicator}"
+
+        return prob_high, drivers_str, time_str, live_features, current_state
+
+    async def update_asset_stream(self, asset: str, csv_path: Path, is_blackout: bool, blackout_title: str) -> None:
+        prefix = asset.lower()
         try:
             df_live = await asyncio.to_thread(load_mt5_csv, str(csv_path))
             if len(df_live) < 500:
-                raise ValueError(f"Only {len(df_live)} bars (need ≥500)")
+                self._log(f"[WARN] MT5 buffer for {asset} < 500 rows. Awaiting data...")
+                return
         except Exception as exc:
             self.query_one(f"#{prefix}_market_data", Static).update(make_waiting_panel(csv_path))
             if self.update_count % 10 == 1:
@@ -504,27 +565,24 @@ class DashboardApp(App):
             return
 
         try:
-            live_features = await asyncio.to_thread(build_features, df_live)
-            current_state = live_features.iloc[[-1]]
-            raw_state     = df_live.iloc[[-1]]
-            last_dt       = live_features.index[-1]
-
-            X_live    = self.scalers[asset].transform(
-                current_state[self.features[asset]].values.astype(np.float32))
-
-            # Calculate SHAP Drivers and Probability (Single Inference Pass)
-            shap_values = self.models[asset].booster_.predict(X_live, pred_contrib=True)[0]
-            raw_margin = np.sum(shap_values)
-            prob_high = float(1.0 / (1.0 + np.exp(-raw_margin)))
+            # 1H Inference
+            prob_1h, drv_1h, time_1h, lf_1h, cs_1h = await self._compute_inference(asset, df_live, "1H")
             
-            self.prob_history[asset].append(prob_high)
+            # 4H Inference
+            df_live_4h = await asyncio.to_thread(resample_to_4h, df_live)
+            if len(df_live_4h) < 20:
+                # Fallback if there isn't enough data
+                prob_4h, drv_4h, time_4h = prob_1h, "INSUFFICIENT BARS", "0m"
+            else:
+                prob_4h, drv_4h, time_4h, _, _ = await self._compute_inference(asset, df_live_4h, "4H")
 
-            gk_current = float(current_state["GK_10"].values[0])
-            gk_avg     = float(live_features["GK_10"].rolling(24 * 30).mean().iloc[-1])
+            # 1H Metrics
+            gk_current = float(cs_1h["GK_10"].values[0])
+            gk_avg     = float(lf_1h["GK_10"].rolling(24 * 30).mean().iloc[-1])
             gk_ratio   = gk_current / gk_avg if gk_avg > 0 else 1.0
 
-            rm_now  = float(current_state["RM2006"].values[0])
-            rm_prev = float(live_features["RM2006"].iloc[-24])
+            rm_now  = float(cs_1h["RM2006"].values[0])
+            rm_prev = float(lf_1h["RM2006"].iloc[-24])
             ewma_trend = (
                 "[b bright_green]▲ ACCELERATING[/b bright_green]"
                 if rm_now > rm_prev else
@@ -540,64 +598,7 @@ class DashboardApp(App):
             else:
                 adr_exhaustion = 0.0
 
-            # Calculate SHAP Drivers
-            contributions = shap_values[:-1]
-            top_indices = np.argsort(np.abs(contributions))[-3:][::-1]
-            top_drivers_list = []
-            for idx in top_indices:
-                feat = self.features[asset][idx]
-                val = contributions[idx]
-                sign = "🟢" if val > 0 else "🔴"
-                top_drivers_list.append(f"{feat} {sign}")
-            drivers_str = " | ".join(top_drivers_list)
-
-            # Calculate Regime State Persistence
-            if self.current_regimes[asset] is None:
-                # Run inference on the entire live buffer to find the true state start time
-                X_all = self.scalers[asset].transform(live_features[self.features[asset]].values.astype(np.float32))
-                probs_all = self.models[asset].predict_proba(X_all)[:, 1]
-                
-                regimes = np.full(len(probs_all), "NEUTRAL", dtype=object)
-                regimes[probs_all > PROB_HIGH] = "HIGH"
-                regimes[probs_all < PROB_LOW] = "LOW"
-                
-                current_regime_val = regimes[-1]
-                changed_indices = np.where(regimes != current_regime_val)[0]
-                
-                if len(changed_indices) > 0:
-                    last_change_idx = changed_indices[-1] + 1
-                    true_start_dt = live_features.index[last_change_idx]
-                    self.regime_is_buffer_limit[asset] = False
-                else:
-                    true_start_dt = live_features.index[0]
-                    self.regime_is_buffer_limit[asset] = True
-                    
-                self.current_regimes[asset] = current_regime_val
-                
-                # Back-calculate the system time when this regime started (handling timezone differences between MT5 and local)
-                broker_elapsed = last_dt - true_start_dt
-                self.regime_start_times[asset] = datetime.now() - broker_elapsed
-
-            if prob_high > PROB_HIGH:
-                new_regime = "HIGH"
-            elif prob_high < PROB_LOW:
-                new_regime = "LOW"
-            else:
-                new_regime = "NEUTRAL"
-                
-            if self.current_regimes[asset] != new_regime:
-                self.current_regimes[asset] = new_regime
-                self.regime_start_times[asset] = datetime.now()
-                self.regime_is_buffer_limit[asset] = False
-                
-            time_in_regime = datetime.now() - self.regime_start_times[asset]
-            mins, secs = divmod(int(time_in_regime.total_seconds()), 60)
-            hrs, mins = divmod(mins, 60)
-            
-            buffer_indicator = "+" if self.regime_is_buffer_limit[asset] else ""
-            time_str = f"{hrs}h {mins}m {secs}s{buffer_indicator}" if hrs > 0 else f"{mins}m {secs}s{buffer_indicator}"
-
-            # Execution logic & UI
+        # Execution logic & UI
             self.query_one(f"#{prefix}_market_data", Static).update(
                 make_market_panel(raw_state, last_dt, asset_title))
             self.query_one(f"#{prefix}_ai_core", Static).update(
@@ -619,13 +620,14 @@ class DashboardApp(App):
                 )
             
             # Update snapshot for discretionary logger
+            time_in_regime = datetime.now() - self.regime_start_times[asset]["1H"]
             self.latest_snapshots[asset] = {
-                "prob_high": prob_high,
-                "regime_state": self.current_regimes[asset],
+                "prob_high": prob_1h,
+                "regime_state": self.current_regimes[asset]["1H"],
                 "state_time_seconds": int(time_in_regime.total_seconds()),
                 "gk_current": gk_current,
                 "gk_ratio": gk_ratio,
-                "top_drivers": top_drivers_list,
+                "top_drivers": drv_1h.split(" | "),
                 "macro_confluence": self.macro_confluence_str,
                 "is_news_blackout": is_blackout
             }
