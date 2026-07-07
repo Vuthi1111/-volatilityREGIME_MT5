@@ -1,0 +1,67 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "filesystem": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/macos/Documents/ALGO/projects/volatility_regime_model"
+      ],
+      "enabled": true
+    },
+    "github": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "enabled": true,
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    },
+    "exa": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@exa-bot/exa-mcp-server"
+      ],
+      "enabled": true,
+      "env": {
+        "EXA_API_KEY": "{env:EXA_API_KEY}"
+      }
+    }
+  },
+  "agent": {
+    "architect": {
+      "description": "Used for architecture and refactoring",
+      "mode": "primary",
+      "model": "anthropic/claude-3-5-sonnet-latest"
+    },
+    "rewriter": {
+      "description": "Used for large context rewrites",
+      "mode": "primary",
+      "model": "google/gemini-2.0-flash-exp"
+    },
+    "debugger": {
+      "description": "Exclusively for debugging syntax errors",
+      "mode": "primary",
+      "model": "openai/gpt-4o"
+    }
+  },
+  "permission": {
+    "edit": "ask",
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "ls*": "allow",
+      "cat*": "allow",
+      "*rm -rf*": "deny"
+    }
+  }
+}

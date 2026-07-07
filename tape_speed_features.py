@@ -100,13 +100,45 @@ def load_gold_1m(path: str) -> pd.DataFrame:
 # 2. PER-BAR ACTIVITY FLAGS (1M resolution)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def normalize_live_1m_columns(df_1m: pd.DataFrame) -> pd.DataFrame:
+    """Normalize live MT5 column names to the schema expected by tape features."""
+    df = df_1m.copy()
+
+    rename_map = {}
+    for src, dst in [
+        ("open", "Open"),
+        ("high", "High"),
+        ("low", "Low"),
+        ("close", "Close"),
+        ("tickvolume", "TickVolume"),
+        ("tick_volume", "TickVolume"),
+        ("Tick_Volume", "TickVolume"),
+        ("volume", "TickVolume"),
+    ]:
+        if src in df.columns and dst not in df.columns:
+            rename_map[src] = dst
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    required_ohlc = ["Open", "High", "Low", "Close"]
+    missing_ohlc = [c for c in required_ohlc if c not in df.columns]
+    if missing_ohlc:
+        raise KeyError(f"Missing OHLC columns for tape features: {missing_ohlc}")
+
+    if "TickVolume" not in df.columns:
+        raise KeyError("Missing volume column for tape features. Expected one of: TickVolume, Tick_Volume, tick_volume, volume")
+
+    df["TickVolume"] = pd.to_numeric(df["TickVolume"], errors="coerce").fillna(0)
+    return df
+
+
 def compute_bar_activity(df_1m: pd.DataFrame) -> pd.DataFrame:
     """
     Flag each 1M bar:
       is_active     = 1 if Close changed vs previous bar
       active_tickvol = TickVolume if is_active else 0
     """
-    df = df_1m.copy()
+    df = normalize_live_1m_columns(df_1m)
     df["is_active"] = (df["Close"] != df["Close"].shift(1)).astype(int)
     # First bar has no prior — set to 0
     df.iloc[0, df.columns.get_loc("is_active")] = 0
@@ -120,25 +152,30 @@ def compute_bar_activity(df_1m: pd.DataFrame) -> pd.DataFrame:
 
 def aggregate_to_15m(df_1m_active: pd.DataFrame) -> pd.DataFrame:
     """
-    Roll up 1M flagged bars to 15M candles with tape speed features.
-    Each 15M bar captures ~15 sub-bars.
+    Roll up 1M flagged bars into rolling 15M windows on a 1-minute frequency.
+    This provides a continuously updating 15M tape flow window.
     """
-    agg = df_1m_active.resample("15min").agg(
-        Open            = ("Open",           "first"),
-        High            = ("High",           "max"),
-        Low             = ("Low",            "min"),
-        Close           = ("Close",          "last"),
-        sum_tickvol     = ("TickVolume",     "sum"),
-        avg_tickvol     = ("TickVolume",     "mean"),
-        max_tickvol     = ("TickVolume",     "max"),
-        std_tickvol     = ("TickVolume",     "std"),
-        active_count    = ("is_active",      "sum"),   # how many 1M bars moved price
-        bar_count       = ("is_active",      "count"), # total 1M bars in window
-        active_tickvol  = ("active_tickvol", "sum"),
-        silent_count    = ("TickVolume",     lambda x: (x == 0).sum()),
-    ).dropna(subset=["Open", "Close"])
-
-    df = agg.copy()
+    w = 15
+    df = pd.DataFrame(index=df_1m_active.index)
+    
+    df["Open"] = df_1m_active["Open"].shift(w - 1)
+    df["High"] = df_1m_active["High"].rolling(w).max()
+    df["Low"]  = df_1m_active["Low"].rolling(w).min()
+    df["Close"]= df_1m_active["Close"]
+    
+    df["sum_tickvol"] = df_1m_active["TickVolume"].rolling(w).sum()
+    df["avg_tickvol"] = df_1m_active["TickVolume"].rolling(w).mean()
+    df["max_tickvol"] = df_1m_active["TickVolume"].rolling(w).max()
+    df["std_tickvol"] = df_1m_active["TickVolume"].rolling(w).std()
+    
+    df["active_count"] = df_1m_active["is_active"].rolling(w).sum()
+    df["bar_count"]    = df_1m_active["is_active"].rolling(w).count()
+    df["active_tickvol"] = df_1m_active["active_tickvol"].rolling(w).sum()
+    
+    is_silent = (df_1m_active["TickVolume"] == 0).astype(int)
+    df["silent_count"] = is_silent.rolling(w).sum()
+    
+    df = df.dropna(subset=["Open", "Close", "sum_tickvol"]).copy()
 
     # active_ratio: fraction of 1M bars where price changed  ← CORE TAPE SPEED SIGNAL
     df["active_ratio"]  = df["active_count"] / df["bar_count"].replace(0, np.nan)
@@ -149,8 +186,8 @@ def aggregate_to_15m(df_1m_active: pd.DataFrame) -> pd.DataFrame:
     # tape_cv: coefficient of variation — bursty vs steady flow
     df["tape_cv"]       = df["std_tickvol"] / (df["avg_tickvol"].replace(0, np.nan))
 
-    # tape_accel: change in avg_tickvol vs prior 15M bar
-    df["tape_accel"]    = df["avg_tickvol"].diff(1)
+    # tape_accel: change in avg_tickvol vs 15 minutes ago
+    df["tape_accel"]    = df["avg_tickvol"].diff(15)
 
     # range in price terms
     price_range         = (df["High"] - df["Low"]).replace(0, np.nan)
@@ -168,12 +205,13 @@ def aggregate_to_15m(df_1m_active: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. ROLLING CONTEXT FEATURES (on 15M series)
+# 4. ROLLING CONTEXT FEATURES (on rolling 15M series)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def add_rolling_context(df_15m: pd.DataFrame,
-                        baseline_short: int = 20,   # 20 bars = 5 hours
-                        baseline_long:  int = 96    # 96 bars = 1 full session
+                        baseline_short: int = 300,   # 300 mins = 5 hours
+                        baseline_long:  int = 1440,   # 1440 mins = 1 full session
+                        is_live: bool = False
                         ) -> pd.DataFrame:
     """
     Z-score tape speed relative to rolling baselines.
@@ -187,19 +225,19 @@ def add_rolling_context(df_15m: pd.DataFrame,
     ]:
         roll_mean = df[col].rolling(window).mean()
         roll_std  = df[col].rolling(window).std().replace(0, np.nan)
-        df[name]  = (df[col] - roll_mean) / roll_std
+        df[name]  = ((df[col] - roll_mean) / roll_std).fillna(0)
 
     # Rolling MA of active_ratio (trend in tape activity)
-    df["active_ratio_ma5"]  = df["active_ratio"].rolling(5).mean()
+    df["active_ratio_ma5"]  = df["active_ratio"].rolling(75).mean()
     df["active_ratio_ma20"] = df["active_ratio"].rolling(baseline_short).mean()
 
     # Smoothed tape acceleration
-    df["tape_accel_ma5"] = df["tape_accel"].rolling(5).mean()
+    df["tape_accel_ma5"] = df["tape_accel"].rolling(75).mean()
 
-    # Volume momentum: ratio of recent 4-bar sum vs baseline
+    # Volume momentum: ratio of recent 60-bar sum vs baseline
     df["tv_momentum"] = (
-        df["sum_tickvol"].rolling(4).sum() /
-        (df["sum_tickvol"].rolling(baseline_long).mean() * 4).replace(0, np.nan)
+        df["sum_tickvol"].rolling(60).sum() /
+        (df["sum_tickvol"].rolling(baseline_long).mean() * 60).replace(0, np.nan)
     )
 
     # Log transforms for skewed distributions
@@ -207,16 +245,17 @@ def add_rolling_context(df_15m: pd.DataFrame,
     df["log_active_tickvol"] = np.log1p(df["active_tickvol"])
     df["log_max_tickvol"]    = np.log1p(df["max_tickvol"])
 
-    # Lag features (past 1, 2, 4 bars)
-    for lag in [1, 2, 4]:
+    # Lag features (past 15, 30, 60 minutes)
+    for lag in [15, 30, 60]:
         df[f"active_ratio_lag{lag}"] = df["active_ratio"].shift(lag)
         df[f"tv_zscore_20_lag{lag}"] = df["tv_zscore_20"].shift(lag)
 
-    # Shift ALL features by 1 bar — no look-ahead
-    feature_cols = [c for c in df.columns
-                    if c not in ["Open", "High", "Low", "Close"]]
-    for col in feature_cols:
-        df[col] = df[col].shift(1)
+    # Shift ALL features by 1 bar — no look-ahead (unless live tracking the current incomplete bar)
+    if not is_live:
+        feature_cols = [c for c in df.columns
+                        if c not in ["Open", "High", "Low", "Close"]]
+        for col in feature_cols:
+            df[col] = df[col].shift(1)
 
     return df
 
@@ -254,11 +293,11 @@ def add_session_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tape_regime_labels(df_15m: pd.DataFrame,
-                              forward_bars:      int   = 16,   # 4 hours ahead
-                              bar_offset:        int   = 1,    # 1-bar buffer
+                              forward_bars:      int   = 240,  # 4 hours ahead (16 * 15m)
+                              bar_offset:        int   = 15,   # 15-min buffer
                               regime_pct_high:   float = 0.70, # top 30% = Fast Tape
                               regime_pct_low:    float = 0.30, # bot 30% = Slow Tape
-                              rolling_baseline:  int   = 672   # 1 week of 15M bars
+                              rolling_baseline:  int   = 10080 # 1 week (672 * 15m)
                               ) -> pd.DataFrame:
     """
     Predict whether the NEXT forward_bars of 15M bars will be
@@ -309,11 +348,11 @@ def build_tape_regime_labels(df_15m: pd.DataFrame,
 
 def build_tape_dataset(df_1m: pd.DataFrame,
                        asset_name: str = "",
-                       forward_bars: int = 16,
-                       bar_offset:   int = 1,
+                       forward_bars: int = 240,
+                       bar_offset:   int = 15,
                        regime_pct_high: float = 0.70,
                        regime_pct_low:  float = 0.30,
-                       rolling_baseline: int  = 672,
+                       rolling_baseline: int  = 10080,
                        verbose: bool = True) -> tuple[pd.DataFrame, list]:
     """
     Full pipeline: 1M raw → 15M feature matrix + tape regime labels.

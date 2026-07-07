@@ -82,11 +82,41 @@ from tape_speed_features import load_nq_1m, load_gold_1m
 # 1. PER-BAR INSTANT FEATURES (1M resolution)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def normalize_live_1m_columns(df_1m: pd.DataFrame) -> pd.DataFrame:
+    """Normalize live MT5 column names to the schema expected by micro features."""
+    df = df_1m.copy()
+
+    rename_map = {}
+    for src, dst in [
+        ("open", "Open"),
+        ("high", "High"),
+        ("low", "Low"),
+        ("close", "Close"),
+        ("tickvolume", "TickVolume"),
+        ("tick_volume", "TickVolume"),
+        ("Tick_Volume", "TickVolume"),
+        ("volume", "TickVolume"),
+    ]:
+        if src in df.columns and dst not in df.columns:
+            rename_map[src] = dst
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    required = ["Open", "High", "Low", "Close", "TickVolume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing columns for micro features: {missing}")
+
+    df["TickVolume"] = pd.to_numeric(df["TickVolume"], errors="coerce").fillna(0)
+    return df
+
+
 def compute_instant_features(df_1m: pd.DataFrame) -> pd.DataFrame:
     """
     Compute single-bar microstructure features.
     No look-ahead — each feature uses only data available AT bar close.
     """
+    df_1m = normalize_live_1m_columns(df_1m)
     df = df_1m[["Open", "High", "Low", "Close", "TickVolume"]].copy()
 
     # Activity flag
@@ -180,7 +210,7 @@ def compute_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     ar15     = df["active_ratio_15"]
     ar_mu60  = ar15.rolling(60, min_periods=10).mean()
     ar_std60 = ar15.rolling(60, min_periods=10).std().replace(0, np.nan)
-    df["ar_zscore_60"] = ((ar15 - ar_mu60) / ar_std60).astype(np.float32)
+    df["ar_zscore_60"] = ((ar15 - ar_mu60) / ar_std60).fillna(0).astype(np.float32)
 
     # ── Acceleration: change in activity level ───────────────────────────────
     df["ar_accel"]   = (df["active_ratio_15"] - df["active_ratio_15"].shift(5)).astype(np.float32)

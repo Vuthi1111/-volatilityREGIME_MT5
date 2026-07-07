@@ -45,8 +45,7 @@ def load_mt5_csv(path: str, sep: str = "\t", _is_retry: bool = False) -> pd.Data
             df = df[df["close"] > 0].copy()
         
         # Capitalize them back to what the rest of the code expects
-        rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close", 
-                      "tick_volume": "Tick_Volume", "volume": "Volume"}
+        rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "tick_volume": "Tick_Volume", "tickvolume": "Tick_Volume", "volume": "Volume"}
         df.rename(columns=rename_map, inplace=True)
         
         # Spread might be missing in some historical data exports
@@ -60,6 +59,47 @@ def load_mt5_csv(path: str, sep: str = "\t", _is_retry: bool = False) -> pd.Data
         else:
             print(f"CRITICAL ERROR loading {path}: {e}")
             raise e
+
+
+def load_mt5_csv_recent(path: str, rows: int = 800, sep: str = "\t", _is_retry: bool = False) -> pd.DataFrame:
+    """Load only the most recent rows from an MT5-exported OHLCV CSV for fast live inference."""
+    try:
+        df = pd.read_csv(path, sep=sep)
+        df.columns = df.columns.str.strip().str.lower()
+
+        if len(df.columns) < 4:
+            raise ValueError("Insufficient columns, likely wrong delimiter.")
+
+        if rows and len(df) > rows:
+            df = df.tail(rows).copy()
+
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"],
+                                            format="%Y.%m.%d %H:%M:%S",
+                                            errors="coerce")
+            df.set_index("datetime", inplace=True)
+        elif "time" in df.columns:
+            df["time"] = pd.to_datetime(df["time"], errors="coerce")
+            df.set_index("time", inplace=True)
+
+        df.sort_index(inplace=True)
+        if "close" in df.columns:
+            df = df[df["close"] > 0].copy()
+
+        rename_map = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "tick_volume": "Tick_Volume", "tickvolume": "Tick_Volume", "volume": "Volume"}
+        df.rename(columns=rename_map, inplace=True)
+
+        if "spread" not in df.columns:
+            df["spread"] = 0
+
+        return df
+    except Exception as e:
+        if not _is_retry:
+            return load_mt5_csv_recent(path, rows=rows, sep="," if sep == "\t" else "\t", _is_retry=True)
+        else:
+            print(f"CRITICAL ERROR loading recent {path}: {e}")
+            raise e
+
 
 
 def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
@@ -81,7 +121,7 @@ def resample_to_4h(df: pd.DataFrame) -> pd.DataFrame:
         agg_dict['Spread'] = 'mean'
         
     # Resample
-    df_4h = df.resample('4H').agg(agg_dict)
+    df_4h = df.resample('4h').agg(agg_dict)
     
     # Drop rows where there is no data
     df_4h.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
@@ -106,7 +146,7 @@ def resample_to_15m(df: pd.DataFrame) -> pd.DataFrame:
         agg_dict['Spread'] = 'mean'
         
     # Resample
-    df_15m = df.resample('15Min').agg(agg_dict)
+    df_15m = df.resample('15min').agg(agg_dict)
     
     # Drop rows where there is no data
     df_15m.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
@@ -498,7 +538,102 @@ def build_features(df: pd.DataFrame,
     return feat
 
 
-def create_breakout_labels(df, k=1.5):
+def build_features_fast_live(df, news_mask_path=None, news_buffer_min=2):
+    """
+    Fast live inference feature builder.
+    Keeps the core trained feature family but skips macro API merging and
+    expensive institutional math so live polling stays responsive.
+    """
+    feat = pd.DataFrame(index=df.index)
+
+    lr = np.log(df["Close"] / df["Close"].shift(1))
+    for lag in [1, 2, 3, 4, 8, 16, 32]:
+        feat[f"ret_lag{lag}"] = lr.shift(lag)
+
+    for w in [5, 10, 20]:
+        feat[f"GK_{w}"]  = garman_klass(df, w).shift(1)
+        feat[f"PK_{w}"]  = parkinson(df, w).shift(1)
+        feat[f"RS_{w}"]  = rogers_satchell(df, w).shift(1)
+
+    har = har_decomposition(lr)
+    feat["HAR_D"] = har["HAR_D"].shift(1)
+    feat["HAR_W"] = har["HAR_W"].shift(1)
+    feat["HAR_M"] = har["HAR_M"].shift(1)
+
+    feat["RM2006"]    = rm2006_ewma(lr).shift(1)
+    feat["HV_20"]     = lr.rolling(20).std().shift(1)
+    feat["MA120_vol"] = feat["HV_20"].rolling(120).mean()
+    feat["vol_ratio"] = feat["GK_10"] / (feat["MA120_vol"] + 1e-9)
+
+    feat["range_ratio"]   = range_ratio(df).shift(1)
+    feat["tickvol_accel"] = tick_vol_acceleration(df).shift(1)
+    feat["vwap_dev"]      = vwap_deviation(df).shift(1)
+
+    feat["roc_5"]  = (df["Close"] / df["Close"].shift(5) - 1).shift(1)
+    feat["roc_20"] = (df["Close"] / df["Close"].shift(20) - 1).shift(1)
+
+    delta = lr.copy()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta).clip(lower=0).rolling(14).mean()
+    rs    = gain / (loss + 1e-9)
+    feat["rsi_14"] = (100 - 100 / (1 + rs)).shift(1)
+
+    ma20  = df["Close"].rolling(20).mean()
+    std20 = df["Close"].rolling(20).std()
+    feat["bb_pos"] = ((df["Close"] - ma20) / (2 * std20 + 1e-9)).shift(1)
+
+    cal = cyclical_time_features(df.index)
+    for col in cal.columns:
+        feat[col] = cal[col]
+
+    if news_mask_path:
+        feat["news_flag"] = load_news_mask(news_mask_path, df.index, news_buffer_min).astype(int)
+    else:
+        feat["news_flag"] = 0
+
+    # Preserve trained column schema with neutral fallbacks for slow live-only exclusions
+    from macro_data_fetcher import merge_macro_features
+    try:
+        df_macro = merge_macro_features(df)
+        macro_cols = [
+            "macro_vix", "macro_vix_pct", 
+            "macro_dxy", "macro_dxy_pct", 
+            "macro_tnx", "macro_tnx_pct", 
+            "macro_hyg", "macro_hyg_pct",
+            "macro_tips", "macro_tips_pct",
+            "gld_volume", "gld_volume_pct",
+            "cot_mm_net_long", "cot_mm_pct_oi"
+        ]
+        for col in macro_cols:
+            if col in df_macro.columns:
+                feat[col] = df_macro[col]
+            else:
+                feat[col] = 0.0
+    except Exception as e:
+        print(f"[Warning] Failed to fetch macro features in fast live: {e}")
+        macro_cols = [
+            "macro_vix", "macro_vix_pct", 
+            "macro_dxy", "macro_dxy_pct", 
+            "macro_tnx", "macro_tnx_pct", 
+            "macro_hyg", "macro_hyg_pct",
+            "macro_tips", "macro_tips_pct",
+            "gld_volume", "gld_volume_pct",
+            "cot_mm_net_long", "cot_mm_pct_oi"
+        ]
+        for col in macro_cols:
+            feat[col] = 0.0
+
+    slow_cols = [
+        "hurst_90", "coint_z_score", "coint_fv", "coint_std",
+        "ou_theta", "ou_mu", "ou_sigma", "ou_halflife",
+    ]
+    for col in slow_cols:
+        feat[col] = 0.0
+
+    return feat
+
+
+
     """
     Creates First Passage Time (Triple-Barrier) labels for the Macro Breakout process.
     Trades WITH the momentum away from the cointegration fair value.

@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import joblib
 from sklearn.preprocessing import StandardScaler
 
 # Import our custom feature engineering
@@ -46,8 +47,32 @@ LIVE_GOLD_PATH = Path(os.path.expanduser("~/Library/Application Support/CrossOve
 LIVE_NAS100_PATH_1M = Path(os.path.expanduser("~/Library/Application Support/CrossOver/Bottles/MT5/drive_c/Program Files/MetaTrader 5/MQL5/Files/nas100_live_1m.csv"))
 LIVE_GOLD_PATH_1M = Path(os.path.expanduser("~/Library/Application Support/CrossOver/Bottles/MT5/drive_c/Program Files/MetaTrader 5/MQL5/Files/xauusd_live_1m.csv"))
 
+MODELS_DIR = PROJECT_ROOT / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
 PROB_HIGH = 0.70
 PROB_LOW  = 0.30
+
+
+def _model_file(name: str) -> Path:
+    return MODELS_DIR / f"{name}.joblib"
+
+
+def save_model_artifact(name: str, payload: dict) -> Path:
+    path = _model_file(name)
+    joblib.dump(payload, path)
+    return path
+
+
+def load_model_artifact(name: str) -> dict:
+    path = _model_file(name)
+    if not path.exists():
+        raise FileNotFoundError(f"Saved model not found: {path}")
+    return joblib.load(path)
+
+
+def has_model_artifact(name: str) -> bool:
+    return _model_file(name).exists()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. TRAIN THE MODEL (Takes < 1 second)
@@ -126,11 +151,23 @@ def train_production_model(asset: str = "NAS100"):
     # Train 4H
     df_hist_4h = resample_to_4h(df_hist_1h)
     model_4h, sc_4h, feat_cols_4h = _train_single_model(df_hist_4h, is_4h=True, asset=asset)
-    
-    return {
+
+    payload = {
         "1H": (model_1h, sc_1h, feat_cols_1h),
-        "4H": (model_4h, sc_4h, feat_cols_4h)
+        "4H": (model_4h, sc_4h, feat_cols_4h),
     }
+    save_model_artifact(f"{asset.lower()}_vol_regime", payload)
+    return payload
+
+
+def load_production_model(asset: str = "NAS100"):
+    payload = load_model_artifact(f"{asset.lower()}_vol_regime")
+    if isinstance(payload, dict):
+        if "1H" not in payload and "1h" in payload:
+            payload["1H"] = payload["1h"]
+        if "4H" not in payload and "4h" in payload:
+            payload["4H"] = payload["4h"]
+    return payload
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,7 +300,7 @@ VWAP_META_COLS = [
 ]
 
 
-def train_vwap_copilot_model():
+def train_vwap_copilot_model(asset: str = "GOLD"):
     """
     Train the 15M VWAP Copilot LightGBM model on all historical data.
     Called once at dashboard boot time.
@@ -271,7 +308,11 @@ def train_vwap_copilot_model():
     """
     from feature_engineering import resample_to_15m, create_vwap_scalp_labels
 
-    hist_path = ROOT / "03_Data" / "raw" / "GOLD_XAUUSD" / "XAUUSD_M5.csv"
+    if asset == "NAS100":
+        hist_path = ROOT / "03_Data" / "raw" / "NAS100" / "5m_data.csv"
+    else:
+        hist_path = ROOT / "03_Data" / "raw" / "GOLD_XAUUSD" / "XAUUSD_M5.csv"
+
     df_raw = load_mt5_csv(str(hist_path))
     df_15m = resample_to_15m(df_raw)
 
@@ -297,8 +338,13 @@ def train_vwap_copilot_model():
         feature_fraction=0.8, verbose=-1, n_estimators=200
     )
     model.fit(X, y, sample_weight=w)
-
+    save_model_artifact(f"{asset.lower()}_vwap_copilot", {"model": model, "features": feature_cols})
     return model, feature_cols
+
+
+def load_vwap_copilot_model(asset: str = "GOLD"):
+    payload = load_model_artifact(f"{asset.lower()}_vwap_copilot")
+    return payload["model"], payload["features"]
 
 
 def compute_vwap_copilot_state(df_live_m1, vwap_model, feature_cols):
@@ -490,7 +536,7 @@ def _compute_tape_features_live(df_1m: pd.DataFrame) -> pd.DataFrame:
 
     df_active = compute_bar_activity(df_1m)
     df_15m = aggregate_to_15m(df_active)
-    df_15m = add_rolling_context(df_15m)
+    df_15m = add_rolling_context(df_15m, is_live=True)
     df_15m = add_session_features(df_15m)
     return df_15m
 
@@ -518,8 +564,13 @@ def train_speed_of_tape_model(asset: str = "NAS100"):
         class_weight="balanced", random_state=42, verbose=-1,
     )
     model.fit(X, y)
-
+    save_model_artifact(f"{asset.lower()}_speed_tape_v2", {"model": model, "features": feat_cols})
     return model, feat_cols
+
+
+def load_speed_of_tape_model(asset: str = "NAS100"):
+    payload = load_model_artifact(f"{asset.lower()}_speed_tape_v2")
+    return payload["model"], payload["features"]
 
 
 def compute_speed_of_tape_state(df_live_1m: pd.DataFrame, model, feature_cols: list) -> dict:
@@ -572,6 +623,7 @@ def compute_speed_of_tape_state(df_live_1m: pd.DataFrame, model, feature_cols: l
     ar = float(latest['active_ratio'].values[0]) if 'active_ratio' in latest.columns else np.nan
     ar_ma = float(latest['active_ratio_ma20'].values[0]) if 'active_ratio_ma20' in latest.columns else np.nan
     tvz = float(latest['tv_zscore_20'].values[0]) if 'tv_zscore_20' in latest.columns else np.nan
+    cur_vol = float(latest['sum_tickvol'].values[0]) if 'sum_tickvol' in latest.columns else np.nan
 
     if prob > 0.70:
         label = "FAST TAPE"
@@ -588,6 +640,7 @@ def compute_speed_of_tape_state(df_live_1m: pd.DataFrame, model, feature_cols: l
         'active_ratio': ar,
         'active_ratio_ma20': ar_ma,
         'tv_zscore_20': tvz,
+        'current_volume': cur_vol,
         'regime_label': label,
         'regime_color': color,
     }
@@ -634,8 +687,13 @@ def train_micro_regime_model(asset: str = "NAS100"):
         class_weight="balanced", random_state=42, verbose=-1,
     )
     model.fit(X, y)
-
+    save_model_artifact(f"{asset.lower()}_micro_regime", {"model": model, "features": feat_cols})
     return model, feat_cols
+
+
+def load_micro_regime_model(asset: str = "NAS100"):
+    payload = load_model_artifact(f"{asset.lower()}_micro_regime")
+    return payload["model"], payload["features"]
 
 
 def compute_micro_regime_state(df_live_1m: pd.DataFrame, model, feature_cols: list) -> dict:

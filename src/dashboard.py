@@ -24,13 +24,14 @@ from textual.containers import Grid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from feature_engineering import load_mt5_csv, build_features, resample_to_4h
+from feature_engineering import load_mt5_csv, load_mt5_csv_recent, build_features, build_features_fast_live, resample_to_4h
 from news_fetcher import get_forexfactory_calendar, check_news_blackout
 from live_inference import (
-    train_production_model, train_vwap_copilot_model,
+    train_production_model, load_production_model,
+    train_vwap_copilot_model, load_vwap_copilot_model,
     compute_vwap_copilot_state,
-    train_speed_of_tape_model, compute_speed_of_tape_state,
-    train_micro_regime_model, compute_micro_regime_state,
+    train_speed_of_tape_model, load_speed_of_tape_model, compute_speed_of_tape_state,
+    train_micro_regime_model, load_micro_regime_model, compute_micro_regime_state,
     LIVE_NAS100_PATH, LIVE_GOLD_PATH,
     LIVE_NAS100_PATH_1M, LIVE_GOLD_PATH_1M,
     PROB_HIGH, PROB_LOW,
@@ -66,7 +67,7 @@ def render_volume_bars(volumes: np.ndarray) -> str:
         chars.append(SPARK_CHARS[idx])
     return f"[cyan]{''.join(chars)}[/cyan]"
 
-def make_market_panel(raw_state, last_dt, asset_title: str) -> Panel:
+def make_market_panel(raw_state, last_dt, asset_title: str, latency_ms: float = 0.0, latency_spark: str = "") -> Panel:
     close = float(raw_state['Close'].values[0])
     high  = float(raw_state['High'].values[0])
     low   = float(raw_state['Low'].values[0])
@@ -78,7 +79,7 @@ def make_market_panel(raw_state, last_dt, asset_title: str) -> Panel:
     t.add_column("Value", justify="right", ratio=3)
     t.add_row("[bold white]INSTRUMENT[/bold white]", f"[b bright_cyan]{asset_title}[/b bright_cyan]")
     t.add_row("", "")
-    t.add_row("LAST CLOSE", f"[b bright_white]{close:,.2f}[/b bright_white]")
+    t.add_row("[b yellow]CURRENT PRICE[/b yellow]", f"[b bright_white]{close:,.2f}[/b bright_white]")
     t.add_row("SESSION HIGH", f"[green]{high:,.2f}[/green]")
     t.add_row("SESSION LOW",  f"[red]{low:,.2f}[/red]")
     t.add_row("HL RANGE",     f"[yellow]{high - low:,.2f}[/yellow]")
@@ -88,13 +89,13 @@ def make_market_panel(raw_state, last_dt, asset_title: str) -> Panel:
     t.add_row("", "")
     t.add_row("DATA TIMESTAMP", f"[dim]{last_dt.strftime('%Y-%m-%d  %H:%M')}[/dim]")
     t.add_row("SYSTEM CLOCK",   f"[dim]{datetime.now().strftime('%H:%M:%S')}[/dim]")
+    if latency_spark:
+        t.add_row("", "")
+        t.add_row("READ LATENCY", f"{latency_ms:.0f}ms")
+        t.add_row("LATENCY TREND", f"[magenta]{latency_spark}[/magenta]")
     return Panel(t, title=" ◈  MARKET TELEMETRY ", border_style="bright_blue", expand=True)
 
 def make_vol_regime_panel(timeframe: str, prob: float, history: deque, top_drivers: str = "") -> Panel:
-    if top_drivers == "INSUFFICIENT BARS":
-        return Panel(
-            Text(f"\n\n[dim]INSUFFICIENT DATA BARS FOR {timeframe} CORE[/dim]", justify="center"),
-            title=f" ◈  {timeframe} INFERENCE CORE ", border_style="dim", expand=True)
     if prob > PROB_HIGH:
         c, s = "bright_green", "▲ EXPANSIVE"
     elif prob < PROB_LOW:
@@ -119,6 +120,7 @@ def make_speed_tape_panel(state: dict, history: deque) -> Panel:
     ar = state.get('active_ratio', np.nan)
     ar_ma = state.get('active_ratio_ma20', np.nan)
     tvz = state.get('tv_zscore_20', np.nan)
+    cur_vol = state.get('current_volume', np.nan)
     label = state.get('regime_label', 'COMPUTING...')
     color = state.get('regime_color', 'dim')
 
@@ -145,6 +147,11 @@ def make_speed_tape_panel(state: dict, history: deque) -> Panel:
         t.add_row("ACTIVE RATIO (20MA)", f"[dim]{ar_ma:.2%} {trend}[/dim]")
     else:
         t.add_row("ACTIVE RATIO (20MA)", "[dim]—[/dim]")
+
+    if not np.isnan(cur_vol):
+        t.add_row("15M TICK VOLUME", f"[cyan]{int(cur_vol):,}[/cyan]")
+    else:
+        t.add_row("15M TICK VOLUME", "[dim]—[/dim]")
 
     if not np.isnan(tvz):
         tvz_color = "magenta" if abs(tvz) > 2 else "yellow" if abs(tvz) > 1 else "dim"
@@ -262,8 +269,13 @@ def make_news_panel(events: list, is_blackout: bool) -> Panel:
         t.add_row("—", "[dim]No High-Impact USD events today.[/dim]", "")
     else:
         for ev in sorted(events, key=lambda x: x['dt']):
+            if ev.get('impact') == "Holiday":
+                t.add_row("[yellow]ALL DAY[/yellow]", f"[yellow]{ev['title']}[/yellow]", "[dim]BANK HOLIDAY[/dim]")
+                continue
+                
             t_str = ev['dt'].strftime("%H:%M")
             delta = ev['dt'] - now
+
             secs = delta.total_seconds()
             if secs < -NEWS_BUFFER_MINUTES * 60:
                 past_secs = abs(secs)
@@ -444,8 +456,10 @@ class DashboardApp(App):
         self.update_count = 0
         self.news_events = []
 
+        self.latency_history = {"NAS100": deque(maxlen=20), "GOLD": deque(maxlen=20)}
         self.prob_history = {
             "NAS100": {"1H": deque(maxlen=PROB_HISTORY_LEN), "4H": deque(maxlen=PROB_HISTORY_LEN),
+                       "15M_VWAP": deque(maxlen=PROB_HISTORY_LEN),
                        "SPEED_TAPE": deque(maxlen=PROB_HISTORY_LEN), "MICRO_REGIME": deque(maxlen=PROB_HISTORY_LEN)},
             "GOLD":   {"1H": deque(maxlen=PROB_HISTORY_LEN), "4H": deque(maxlen=PROB_HISTORY_LEN),
                        "15M_VWAP": deque(maxlen=PROB_HISTORY_LEN),
@@ -455,10 +469,25 @@ class DashboardApp(App):
         self.speed_tape_models = {"NAS100": None, "GOLD": None}
         self.micro_regime_models = {"NAS100": None, "GOLD": None}
         self.adr_20_map = {"NAS100": 1.0, "GOLD": 1.0}
-        self.vwap_copilot = None
-        self.vwap_copilot_state = {}
-        self.speed_tape_state = {}
-        self.micro_regime_state = {}
+        self.vwap_copilot_models = {"NAS100": None, "GOLD": None}
+        self.vwap_copilot_state_map = {"NAS100": {}, "GOLD": {}}
+        self.speed_tape_state_map = {"NAS100": {}, "GOLD": {}}
+        self.micro_regime_state_map = {"NAS100": {}, "GOLD": {}}
+        self._is_updating = False
+        self._is_rendering = False
+        self.data_refresh_seconds = 10.0
+        self.last_data_refresh_at = None
+        self.asset_last_dt = {"NAS100": None, "GOLD": None}
+        self.asset_last_raw_state = {"NAS100": None, "GOLD": None}
+        self.asset_last_prob_1h = {"NAS100": np.nan, "GOLD": np.nan}
+        self.asset_last_prob_4h = {"NAS100": np.nan, "GOLD": np.nan}
+        self.asset_last_drv_1h = {"NAS100": "", "GOLD": ""}
+        self.asset_last_drv_4h = {"NAS100": "", "GOLD": ""}
+        self.asset_last_cs_1h = {"NAS100": None, "GOLD": None}
+        self.asset_last_time_1h = {"NAS100": datetime.now(), "GOLD": datetime.now()}
+        self.asset_last_gk_current = {"NAS100": np.nan, "GOLD": np.nan}
+        self.asset_last_gk_ratio = {"NAS100": np.nan, "GOLD": np.nan}
+        self.asset_last_adr_exhaustion = {"NAS100": 0.0, "GOLD": 0.0}
 
         self.current_regimes = {"NAS100": {"1H": None, "4H": None}, "GOLD": {"1H": None, "4H": None}}
         self.regime_start_times = {"NAS100": {"1H": None, "4H": None}, "GOLD": {"1H": None, "4H": None}}
@@ -476,12 +505,13 @@ class DashboardApp(App):
         yield Static(Panel("", title=" ◈  MACRO ENVIRONMENT (T-1) ", border_style="dim"), id="macro_environment")
         with TabbedContent(initial="tab-nas100"):
             with TabPane("⚡ NAS100", id="tab-nas100"):
-                with Grid(id="nas100-grid", classes="nas100-grid"):
+                with Grid(id="nas100-grid", classes="gold-grid"):
                     yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_market_data", classes="panel")
                     yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_1h_core", classes="panel")
-                    yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_speed_tape", classes="panel")
+                    yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_vwap_copilot", classes="panel row-span-2")
                     yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_news", classes="panel")
                     yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_4h_core", classes="panel")
+                    yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_speed_tape", classes="panel")
                     yield Static(Panel(Text("\n\n⏳  Loading…", justify="center"), border_style="dim", expand=True), id="nas100_micro_regime", classes="panel")
                     yield Static(Panel(Text("\n\n🔒  Locked.", justify="center"), border_style="dim", expand=True), id="nas100_execution", classes="panel span-3")
 
@@ -533,15 +563,19 @@ class DashboardApp(App):
                 else:
                     hist_path = "/Users/macos/Documents/ALGO/03_Data/raw/GOLD_XAUUSD/XAUUSD_1H.csv"
 
-                await boot_msg(f"Loading & training {asset} Vol Regime…")
                 df_hist = await asyncio.to_thread(load_mt5_csv, hist_path)
                 df_daily = df_hist.resample('D').agg({'High': 'max', 'Low': 'min'}).dropna()
                 adr_20 = (df_daily['High'] - df_daily['Low']).rolling(20).mean().iloc[-1]
                 self.adr_20_map[asset] = adr_20
 
-                models_dict = await asyncio.to_thread(train_production_model, asset)
-                self.models[asset] = models_dict
-                await boot_msg(f"✅ Vol Regime models (1H & 4H) for {asset} compiled.")
+                try:
+                    await boot_msg(f"Loading saved {asset} Vol Regime…")
+                    self.models[asset] = await asyncio.to_thread(load_production_model, asset)
+                    await boot_msg(f"✅ Vol Regime models (1H & 4H) for {asset} loaded.")
+                except Exception:
+                    await boot_msg(f"Training {asset} Vol Regime…")
+                    self.models[asset] = await asyncio.to_thread(train_production_model, asset)
+                    await boot_msg(f"✅ Vol Regime models (1H & 4H) for {asset} compiled and saved.")
             except Exception as e:
                 await boot_msg(f"❌ {asset} Vol Regime training failed: {e}")
                 self.notify(f"⚠  {asset} Vol Regime error: {e}", severity="error", timeout=10)
@@ -551,10 +585,14 @@ class DashboardApp(App):
         await boot_msg("=" * 40)
         for asset in ["NAS100", "GOLD"]:
             try:
-                await boot_msg(f"Training Speed of Tape ({asset}) on 1M history…")
-                tape_model, tape_feat = await asyncio.to_thread(train_speed_of_tape_model, asset)
-                self.speed_tape_models[asset] = (tape_model, tape_feat)
-                await boot_msg(f"✅ Speed of Tape model for {asset} compiled.")
+                try:
+                    await boot_msg(f"Loading saved Speed of Tape ({asset})…")
+                    self.speed_tape_models[asset] = await asyncio.to_thread(load_speed_of_tape_model, asset)
+                    await boot_msg(f"✅ Speed of Tape model for {asset} loaded.")
+                except Exception:
+                    await boot_msg(f"Training Speed of Tape ({asset}) on 1M history…")
+                    self.speed_tape_models[asset] = await asyncio.to_thread(train_speed_of_tape_model, asset)
+                    await boot_msg(f"✅ Speed of Tape model for {asset} compiled and saved.")
             except Exception as e:
                 await boot_msg(f"❌ {asset} Speed of Tape training failed: {e}")
 
@@ -563,22 +601,32 @@ class DashboardApp(App):
         await boot_msg("=" * 40)
         for asset in ["NAS100", "GOLD"]:
             try:
-                await boot_msg(f"Training Micro-Regime ({asset}) on 1M history…")
-                micro_model, micro_feat = await asyncio.to_thread(train_micro_regime_model, asset)
-                self.micro_regime_models[asset] = (micro_model, micro_feat)
-                await boot_msg(f"✅ Micro-Regime model for {asset} compiled.")
+                try:
+                    await boot_msg(f"Loading saved Micro-Regime ({asset})…")
+                    self.micro_regime_models[asset] = await asyncio.to_thread(load_micro_regime_model, asset)
+                    await boot_msg(f"✅ Micro-Regime model for {asset} loaded.")
+                except Exception:
+                    await boot_msg(f"Training Micro-Regime ({asset}) on 1M history…")
+                    self.micro_regime_models[asset] = await asyncio.to_thread(train_micro_regime_model, asset)
+                    await boot_msg(f"✅ Micro-Regime model for {asset} compiled and saved.")
             except Exception as e:
                 await boot_msg(f"❌ {asset} Micro-Regime training failed: {e}")
 
         await boot_msg("=" * 40)
-        await boot_msg("PHASE 4/5 — VWAP Copilot (GOLD 15M)")
+        await boot_msg("PHASE 4/5 — VWAP Copilot (15M)")
         await boot_msg("=" * 40)
-        try:
-            await boot_msg("Training 15M VWAP Copilot model on historical Gold data…")
-            self.vwap_copilot = await asyncio.to_thread(train_vwap_copilot_model)
-            await boot_msg("✅ VWAP Copilot compiled.")
-        except Exception as e:
-            await boot_msg(f"❌ VWAP Copilot training failed: {e}")
+        for asset in ["NAS100", "GOLD"]:
+            try:
+                try:
+                    await boot_msg(f"Loading saved VWAP Copilot ({asset})…")
+                    self.vwap_copilot_models[asset] = await asyncio.to_thread(load_vwap_copilot_model, asset)
+                    await boot_msg(f"✅ VWAP Copilot for {asset} loaded.")
+                except Exception:
+                    await boot_msg(f"Training 15M VWAP Copilot for {asset}…")
+                    self.vwap_copilot_models[asset] = await asyncio.to_thread(train_vwap_copilot_model, asset)
+                    await boot_msg(f"✅ VWAP Copilot for {asset} compiled and saved.")
+            except Exception as e:
+                await boot_msg(f"❌ VWAP Copilot training failed for {asset}: {e}")
 
         await boot_msg("=" * 40)
         await boot_msg("PHASE 5/5 — Starting live loop")
@@ -587,45 +635,59 @@ class DashboardApp(App):
         elapsed = time_module.time() - boot_start
         await boot_msg(f"Boot complete — {elapsed:.1f}s total. Entering live loop.")
         self.set_interval(1.0, self.update_dashboard)
+        await self.update_dashboard()
         self.query_one("#boot_log").remove()
 
     # ── Live Update ──────────────────────────────────────────────────────────
     async def update_dashboard(self) -> None:
-        self.update_count += 1
-        is_blackout, blackout_title = check_news_blackout(self.news_events)
-
-        news_panel = make_news_panel(self.news_events, is_blackout)
-        self.query_one("#nas100_news", Static).update(news_panel)
-        self.query_one("#gold_news", Static).update(news_panel)
-
-        await asyncio.gather(
-            self.update_asset_stream("NAS100", LIVE_NAS100_PATH, LIVE_NAS100_PATH_1M, is_blackout, blackout_title),
-            self.update_asset_stream("GOLD",   LIVE_GOLD_PATH,   LIVE_GOLD_PATH_1M,   is_blackout, blackout_title)
-        )
-
-        nas_reg = self.current_regimes["NAS100"]["1H"]
-        gold_reg = self.current_regimes["GOLD"]["1H"]
-        if nas_reg and gold_reg:
-            if nas_reg == "HIGH" and gold_reg == "HIGH":
-                confluence = "[b bright_red]SYSTEMIC VOLATILITY SHOCK (BOTH EXPANDING)[/b bright_red]"
-                color = "red"
-            elif nas_reg == "LOW" and gold_reg == "LOW":
-                confluence = "[b bright_green]SYSTEMIC COMPRESSION (BOTH RANGEBOUND)[/b bright_green]"
-                color = "green"
-            else:
-                confluence = f"[b bright_yellow]DIVERGENT MACRO STATES (NAS100: {nas_reg}  |  GOLD: {gold_reg})[/b bright_yellow]"
-                color = "yellow"
-            self.macro_confluence_str = Text.from_markup(confluence).plain
-            self.query_one("#macro_confluence", Static).update(
-                Panel(Text.from_markup(confluence, justify="center"), title=" ◈  MACRO CONFLUENCE ", border_style=color))
+        if getattr(self, "_is_updating", False):
+            return
+        self._is_updating = True
+        try:
+            self.update_count += 1
+            self.last_data_refresh_at = datetime.now()
+            
+            is_blackout, blackout_title = check_news_blackout(self.news_events)
+            news_panel = make_news_panel(self.news_events, is_blackout)
+            self.query_one("#nas100_news", Static).update(news_panel)
+            self.query_one("#gold_news", Static).update(news_panel)
+            
+            await asyncio.gather(
+                self.update_asset_stream("NAS100", LIVE_NAS100_PATH, LIVE_NAS100_PATH_1M, is_blackout, blackout_title),
+                self.update_asset_stream("GOLD",   LIVE_GOLD_PATH,   LIVE_GOLD_PATH_1M,   is_blackout, blackout_title)
+            )
+            
+            nas_reg = self.current_regimes["NAS100"]["1H"]
+            gold_reg = self.current_regimes["GOLD"]["1H"]
+            if nas_reg and gold_reg:
+                if nas_reg == "HIGH" and gold_reg == "HIGH":
+                    confluence = "[b bright_red]SYSTEMIC VOLATILITY SHOCK (BOTH EXPANDING)[/b bright_red]"
+                    color = "red"
+                elif nas_reg == "LOW" and gold_reg == "LOW":
+                    confluence = "[b bright_green]SYSTEMIC COMPRESSION (BOTH RANGEBOUND)[/b bright_green]"
+                    color = "green"
+                else:
+                    confluence = f"[b bright_yellow]DIVERGENT MACRO STATES (NAS100: {nas_reg}  |  GOLD: {gold_reg})[/b bright_yellow]"
+                    color = "yellow"
+                self.macro_confluence_str = Text.from_markup(confluence).plain
+                self.query_one("#macro_confluence", Static).update(
+                    Panel(Text.from_markup(confluence, justify="center"), title=" ◈  MACRO CONFLUENCE ", border_style=color))
+        finally:
+            self._is_updating = False
 
     async def _compute_inference(self, asset: str, df_live: pd.DataFrame, timeframe: str):
         model, scaler, feature_cols = self.models[asset][timeframe]
-        live_features = await asyncio.to_thread(build_features, df_live)
+        live_features = await asyncio.to_thread(build_features_fast_live, df_live)
         current_state = live_features.iloc[[-1]]
         last_dt = live_features.index[-1]
-        X_live = scaler.transform(current_state[feature_cols].values.astype(np.float32))
-        shap_values = model.booster_.predict(X_live, pred_contrib=True)[0]
+        
+        def _do_live_predict():
+            X_live_local = scaler.transform(current_state[feature_cols].values.astype(np.float32))
+            shap_vals_local = model.booster_.predict(X_live_local, pred_contrib=True)[0]
+            return shap_vals_local
+        
+        shap_values = await asyncio.to_thread(_do_live_predict)
+        
         raw_margin = np.sum(shap_values)
         prob_high = float(1.0 / (1.0 + np.exp(-raw_margin)))
         self.prob_history[asset][timeframe].append(prob_high)
@@ -640,8 +702,12 @@ class DashboardApp(App):
         drivers_str = " | ".join(top_drivers_list)
 
         if self.current_regimes[asset][timeframe] is None:
-            X_all = scaler.transform(live_features[feature_cols].values.astype(np.float32))
-            probs_all = model.predict_proba(X_all)[:, 1]
+            def _do_all_predict():
+                X_all_local = scaler.transform(live_features[feature_cols].values.astype(np.float32))
+                return model.predict_proba(X_all_local)[:, 1]
+                
+            probs_all = await asyncio.to_thread(_do_all_predict)
+            
             regimes = np.full(len(probs_all), "NEUTRAL", dtype=object)
             regimes[probs_all > PROB_HIGH] = "HIGH"
             regimes[probs_all < PROB_LOW] = "LOW"
@@ -678,8 +744,9 @@ class DashboardApp(App):
     async def update_asset_stream(self, asset: str, csv_path: Path, csv_path_1m: Path,
                                    is_blackout: bool, blackout_title: str) -> None:
         prefix = asset.lower()
+        t_start = time_module.time()
         try:
-            df_live = await asyncio.to_thread(load_mt5_csv, str(csv_path))
+            df_live = await asyncio.to_thread(load_mt5_csv_recent, str(csv_path), 5000)
             if len(df_live) < 500:
                 return
         except Exception as exc:
@@ -691,19 +758,18 @@ class DashboardApp(App):
         try:
             prob_1h, drv_1h, time_1h, lf_1h, cs_1h = await self._compute_inference(asset, df_live, "1H")
             df_live_4h = await asyncio.to_thread(resample_to_4h, df_live)
-            if len(df_live_4h) < 20:
-                prob_4h, drv_4h, time_4h = prob_1h, "INSUFFICIENT BARS", "0m"
-            else:
+            prob_4h, drv_4h, time_4h = 0.5, "", "0m"
+            if len(df_live_4h) >= 20:
                 prob_4h, drv_4h, time_4h, _, _ = await self._compute_inference(asset, df_live_4h, "4H")
 
             # ── Speed of Tape via 1M live data ─────────────────────────────────
             try:
-                df_live_1m = await asyncio.to_thread(load_mt5_csv, str(csv_path_1m))
+                df_live_1m = await asyncio.to_thread(load_mt5_csv_recent, str(csv_path_1m), 5000)
                 if len(df_live_1m) >= 200 and self.speed_tape_models.get(asset) is not None:
                     st_model, st_feat = self.speed_tape_models[asset]
-                    self.speed_tape_state = await asyncio.to_thread(
+                    self.speed_tape_state_map[asset] = await asyncio.to_thread(
                         compute_speed_of_tape_state, df_live_1m, st_model, st_feat)
-                    st_p = self.speed_tape_state.get('tape_regime_prob', np.nan)
+                    st_p = self.speed_tape_state_map[asset].get('tape_regime_prob', np.nan)
                     if not np.isnan(st_p):
                         self.prob_history[asset]["SPEED_TAPE"].append(st_p)
             except Exception as exc:
@@ -714,24 +780,27 @@ class DashboardApp(App):
             try:
                 if len(df_live_1m) >= 100 and self.micro_regime_models.get(asset) is not None:
                     mr_model, mr_feat = self.micro_regime_models[asset]
-                    self.micro_regime_state = await asyncio.to_thread(
+                    self.micro_regime_state_map[asset] = await asyncio.to_thread(
                         compute_micro_regime_state, df_live_1m, mr_model, mr_feat)
-                    mr_p = self.micro_regime_state.get('micro_regime_prob', np.nan)
+                    mr_p = self.micro_regime_state_map[asset].get('micro_regime_prob', np.nan)
                     if not np.isnan(mr_p):
                         self.prob_history[asset]["MICRO_REGIME"].append(mr_p)
             except Exception as exc:
                 if self.update_count % 10 == 1:
                     self._log(f"[WARN] Micro-Regime ({asset}) — {exc}")
 
-            # ── VWAP Copilot (GOLD only) ────────────────────────────────────────
-            if asset == "GOLD" and self.vwap_copilot is not None:
-                if len(df_live_1m) >= 100:
-                    vwap_model, vwap_feat_cols = self.vwap_copilot
-                    self.vwap_copilot_state = await asyncio.to_thread(
+            # ── VWAP Copilot (per asset) ──────────────────────────────────────
+            if self.vwap_copilot_models.get(asset) is not None and len(df_live_1m) >= 100:
+                try:
+                    vwap_model, vwap_feat_cols = self.vwap_copilot_models[asset]
+                    self.vwap_copilot_state_map[asset] = await asyncio.to_thread(
                         compute_vwap_copilot_state, df_live_1m, vwap_model, vwap_feat_cols)
-                    ml_p = self.vwap_copilot_state.get('ml_probability', float('nan'))
+                    ml_p = self.vwap_copilot_state_map[asset].get('ml_probability', float('nan'))
                     if not np.isnan(ml_p):
-                        self.prob_history["GOLD"]["15M_VWAP"].append(ml_p)
+                        self.prob_history[asset]["15M_VWAP"].append(ml_p)
+                except Exception as exc:
+                    if self.update_count % 10 == 1:
+                        self._log(f"[WARN] VWAP Copilot ({asset}) — {exc}")
 
             # ── Metrics ─────────────────────────────────────────────────────────
             gk_current = float(cs_1h["GK_10"].values[0])
@@ -749,29 +818,18 @@ class DashboardApp(App):
             else:
                 adr_exhaustion = 0.0
 
-            # ── Render ──────────────────────────────────────────────────────────
-            raw_state = df_live.iloc[[-1]]
-            last_dt = df_live.index[-1]
-            self.query_one(f"#{prefix}_market_data", Static).update(make_market_panel(raw_state, last_dt, asset))
-            self.query_one("#macro_environment", Static).update(make_macro_environment_panel(cs_1h))
-
-            self.query_one(f"#{prefix}_1h_core", Static).update(
-                make_vol_regime_panel("1H", prob_1h, self.prob_history[asset]["1H"], drv_1h))
-            self.query_one(f"#{prefix}_4h_core", Static).update(
-                make_vol_regime_panel("4H", prob_4h, self.prob_history[asset]["4H"], drv_4h))
-
-            self.query_one(f"#{prefix}_speed_tape", Static).update(
-                make_speed_tape_panel(self.speed_tape_state, self.prob_history[asset]["SPEED_TAPE"]))
-            self.query_one(f"#{prefix}_micro_regime", Static).update(
-                make_micro_regime_panel(self.micro_regime_state, self.prob_history[asset]["MICRO_REGIME"]))
-
-            if asset == "GOLD":
-                self.query_one("#gold_vwap_copilot", Static).update(
-                    make_vwap_copilot_panel(self.vwap_copilot_state, self.prob_history["GOLD"]["15M_VWAP"]))
-
-            self.query_one(f"#{prefix}_execution", Static).update(
-                make_execution_panel(prob_1h, is_blackout, blackout_title, self.update_count,
-                                    adr_exhaustion, time_1h))
+            # ── Cache State ─────────────────────────────────────────────────────────
+            self.asset_last_raw_state[asset] = df_live.iloc[[-1]]
+            self.asset_last_dt[asset] = df_live.index[-1]
+            self.asset_last_prob_1h[asset] = prob_1h
+            self.asset_last_prob_4h[asset] = prob_4h
+            self.asset_last_drv_1h[asset] = drv_1h
+            self.asset_last_drv_4h[asset] = drv_4h
+            self.asset_last_cs_1h[asset] = cs_1h
+            self.asset_last_time_1h[asset] = time_1h
+            self.asset_last_gk_current[asset] = gk_current
+            self.asset_last_gk_ratio[asset] = gk_ratio
+            self.asset_last_adr_exhaustion[asset] = adr_exhaustion
 
             if self.update_count % 60 == 0:
                 self._log(
@@ -791,12 +849,35 @@ class DashboardApp(App):
                 "macro_confluence": self.macro_confluence_str,
                 "is_news_blackout": is_blackout
             }
-            if asset == "GOLD" and self.vwap_copilot_state:
-                snapshot["vwap_zscore"] = self.vwap_copilot_state.get("vwap_zscore")
-                snapshot["ml_reversion_prob"] = self.vwap_copilot_state.get("ml_probability")
-                snapshot["hurst"] = self.vwap_copilot_state.get("hurst")
-                snapshot["copilot_signal"] = self.vwap_copilot_state.get("signal")
+            if self.vwap_copilot_state_map.get(asset):
+                snapshot["vwap_zscore"] = self.vwap_copilot_state_map[asset].get("vwap_zscore")
+                snapshot["ml_reversion_prob"] = self.vwap_copilot_state_map[asset].get("ml_probability")
+                snapshot["hurst"] = self.vwap_copilot_state_map[asset].get("hurst")
+                snapshot["copilot_signal"] = self.vwap_copilot_state_map[asset].get("signal")
             self.latest_snapshots[asset] = snapshot
+            
+            t_end = time_module.time()
+            latency_ms = (t_end - t_start) * 1000.0
+            self.latency_history[asset].append(latency_ms)
+            spark = render_sparkline(self.latency_history[asset])
+            
+            self.query_one(f"#{prefix}_market_data", Static).update(
+                make_market_panel(df_live.iloc[[-1]], df_live.index[-1], asset, latency_ms, spark))
+            self.query_one("#macro_environment", Static).update(
+                make_macro_environment_panel(cs_1h))
+            self.query_one(f"#{prefix}_1h_core", Static).update(
+                make_vol_regime_panel("1H", prob_1h, self.prob_history[asset]["1H"], drv_1h))
+            self.query_one(f"#{prefix}_4h_core", Static).update(
+                make_vol_regime_panel("4H", prob_4h, self.prob_history[asset]["4H"], drv_4h))
+            self.query_one(f"#{prefix}_speed_tape", Static).update(
+                make_speed_tape_panel(self.speed_tape_state_map.get(asset, {}), self.prob_history[asset]["SPEED_TAPE"]))
+            self.query_one(f"#{prefix}_micro_regime", Static).update(
+                make_micro_regime_panel(self.micro_regime_state_map.get(asset, {}), self.prob_history[asset]["MICRO_REGIME"]))
+            if self.vwap_copilot_state_map.get(asset):
+                self.query_one(f"#{prefix}_vwap_copilot", Static).update(
+                    make_vwap_copilot_panel(self.vwap_copilot_state_map[asset], self.prob_history[asset]["15M_VWAP"]))
+            self.query_one(f"#{prefix}_execution", Static).update(
+                make_execution_panel(prob_1h, is_blackout, blackout_title, self.update_count, adr_exhaustion, time_1h))
 
         except Exception as exc:
             err = Panel(Text.from_markup(f"[b red]⚠  INFERENCE ERROR ({asset})[/b red]\n\n{exc}", justify="center"),
@@ -836,7 +917,7 @@ class DashboardApp(App):
         self._log_discretionary("EXIT")
 
     def action_force_quit(self) -> None:
-        self.exit()
+        raise SystemExit(0)
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -850,4 +931,6 @@ if __name__ == "__main__":
     try:
         app.run()
     except KeyboardInterrupt:
-        pass
+        os._exit(130)
+    except SystemExit:
+        os._exit(0)
