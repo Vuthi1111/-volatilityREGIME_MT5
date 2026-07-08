@@ -16,7 +16,7 @@
 #include <VolRegime/NewsCalendar.mqh>
 
 input group "--- UI & Positioning ---"
-input ENUM_VR_CORNER DashboardCorner = VR_CORNER_TOP_LEFT; // Dashboard Position
+input ENUM_VR_CORNER DashboardCorner = VR_CORNER_TOP_RIGHT; // Dashboard Position
 input int DashboardMarginX = 20;                           // X Margin (pixels)
 input int DashboardMarginY = 40;                           // Y Margin (pixels)
 input ENUM_VR_THEME DashboardTheme = VR_THEME_DARK;        // UI Color Theme
@@ -28,6 +28,7 @@ input bool EnableAlerts = false;                                       // Enable
 
 VRDashboardLayout g_layout;
 VRMacroContext g_macro;
+CVolRegimeDashboard *g_dashboard;
 datetime g_last_calc_time = 0;
 
 double g_smoothed_vol_1h = 0.0;
@@ -47,7 +48,7 @@ double GetThreshold()
 
 int OnInit()
 {
-   g_layout.panel_width = 270;
+   g_layout.panel_width = 340; // Vertical sidebar width
    g_layout.panel_height = 80;
    g_layout.gap = 10;
    
@@ -68,12 +69,13 @@ int OnInit()
       g_layout.text_dim = C'100,105,110';
    }
    
-   // Temporary layout values until first OnTimer
    g_layout.x = DashboardMarginX;
-   g_layout.y = DashboardMarginY + 30; 
+   g_layout.y = DashboardMarginY; 
    
    VRZeroMacroContext(g_macro);
    VRNewsLoadDefaultTemplate();
+   
+   g_dashboard = new CVolRegimeDashboard(0, g_layout);
    
    EventSetTimer(1); // 1-second refresh for UI/tape
    return(INIT_SUCCEEDED);
@@ -82,7 +84,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   ObjectsDeleteAll(0, "VRM_");
+   delete g_dashboard;
 }
 
 int OnCalculate(const int rates_total,
@@ -99,6 +101,21 @@ int OnCalculate(const int rates_total,
    return(rates_total);
 }
 
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(StringFind(sparam, "MIN_BTN") >= 0 || StringFind(sparam, "_HDR") >= 0)
+      {
+         g_dashboard.ToggleMinimize();
+         OnTimer(); // Force re-render immediately
+      }
+   }
+}
+
 void OnTimer()
 {
    datetime current_time = TimeCurrent();
@@ -106,30 +123,35 @@ void OnTimer()
    // Layout positioning
    int chart_w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    int chart_h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS);
-   int total_w = (g_layout.panel_width * 2) + g_layout.gap;
-   int total_h = (g_layout.panel_height * 3) + (g_layout.gap * 2) + 40;
+   int total_w = g_layout.panel_width;
+   
+   // Approximate total height based on minimized state
+   int total_h = g_dashboard.IsMinimized() ? 35 : 420; 
    
    if(chart_w > 0 && chart_h > 0)
    {
+      int x = DashboardMarginX;
+      int y = DashboardMarginY;
       switch(DashboardCorner)
       {
          case VR_CORNER_TOP_LEFT:
-            g_layout.x = DashboardMarginX;
-            g_layout.y = DashboardMarginY + 30; // +30 for header
+            x = DashboardMarginX;
+            y = DashboardMarginY;
             break;
          case VR_CORNER_TOP_RIGHT:
-            g_layout.x = chart_w - total_w - DashboardMarginX;
-            g_layout.y = DashboardMarginY + 30;
+            x = chart_w - total_w - DashboardMarginX;
+            y = DashboardMarginY;
             break;
          case VR_CORNER_BOTTOM_LEFT:
-            g_layout.x = DashboardMarginX;
-            g_layout.y = chart_h - total_h - DashboardMarginY + 30;
+            x = DashboardMarginX;
+            y = chart_h - total_h - DashboardMarginY;
             break;
          case VR_CORNER_BOTTOM_RIGHT:
-            g_layout.x = chart_w - total_w - DashboardMarginX;
-            g_layout.y = chart_h - total_h - DashboardMarginY + 30;
+            x = chart_w - total_w - DashboardMarginX;
+            y = chart_h - total_h - DashboardMarginY;
             break;
       }
+      g_dashboard.SetPosition(x, y, total_w);
    }
    
    // Rate arrays
@@ -146,14 +168,7 @@ void OnTimer()
    
    if(copied_1m < 1450 || copied_15m < 120 || copied_1h < 150 || copied_4h < 150)
    {
-       VRCreateOrUpdateRect(0, VRPanelName(0, "MAIN_BG"), g_layout.x - 10, g_layout.y - 30, (g_layout.panel_width * 2) + g_layout.gap + 20, (g_layout.panel_height * 3) + (g_layout.gap * 2) + 40, g_layout.bg_main, g_layout.bg_main);
-       string header = _Symbol + " | SYNCHRONIZING HISTORY...";
-       VRCreateOrUpdateLabel(0, VRPanelName(0, "HEADER"), g_layout.x, g_layout.y - 22, header, clrGold, 11, "Consolas Bold");
-       
-       string sync_text = StringFormat("M1: %d/1450 | M15: %d/120 | H1: %d/150 | H4: %d/150", 
-                                       MathMax(0, copied_1m), MathMax(0, copied_15m), MathMax(0, copied_1h), MathMax(0, copied_4h));
-       
-       VRRenderPanel(0, g_layout, VRPanelName(0, "VOL"), g_layout.x, g_layout.y, (g_layout.panel_width * 2) + g_layout.gap, g_layout.panel_height, "Status", "Waiting for broker data...", sync_text, clrGold);
+       // Not enough data yet
        return;
    }
    
@@ -220,9 +235,11 @@ void OnTimer()
    }
    g_was_expansive_last_tick = is_expansive;
    
-   // Render
+   // Push history to UI
+   g_dashboard.PushHistory(islap.vol_1h_prob, islap.vol_4h_prob, islap.tape_prob, islap.micro_prob, islap.vwap_prob);
+   
+   // Render UI
    VRNewsEvaluate(current_time, islap.news);
-   VRCreateOrUpdateRect(0, VRPanelName(0, "MAIN_BG"), g_layout.x - 10, g_layout.y - 30, (g_layout.panel_width * 2) + g_layout.gap + 20, (g_layout.panel_height * 3) + (g_layout.gap * 2) + 40, g_layout.bg_main, g_layout.bg_main);
-   VRRenderDashboard(0, g_layout, islap, thresh);
+   g_dashboard.Render(islap, thresh);
 }
 //+------------------------------------------------------------------+
