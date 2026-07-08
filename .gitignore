@@ -1,23 +1,8 @@
-# Byte-compiled / optimized / DLL files
+*.py
+*.pyc
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Mac OS
+*.ipynb
+*.joblib
+*.svg
 .DS_Store
-
-# Virtual Environments
-venv/
-env/
-.env
-
-# Jupyter Notebooks
-.ipynb_checkpoints
-
-# Results and logs
-results/
-*.log
-*.png
-*.jpg
-03_Data/
-scratch/
+MQL5_clean/
